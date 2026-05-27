@@ -177,6 +177,23 @@ final class GDDriver implements DriverInterface
         return $this->fromString($decoded);
     }
 
+    /**
+     * Load an image from a driver-native GdImage instance or a raw binary string.
+     *
+     * **Format note:** when $blob is a {@see GdImage}, PHP provides no API to
+     * recover the original file format from the in-memory pixel buffer.
+     * The driver therefore retains whatever format was last set (default:
+     * {@see Format::JPEG} on a fresh instance).  If you need a specific output
+     * format after loading a raw GdImage, call the relevant conversion method
+     * explicitly (e.g. {@see toPng()}, {@see toWebp()}) before any output call.
+     *
+     * When $blob is a binary string the format is detected automatically from
+     * the data headers, matching the behaviour of {@see fromString()}.
+     *
+     * @param mixed $blob A GdImage instance or a raw binary image string.
+     * @return static
+     * @throws ImageLoadException When $blob is not a GdImage or a valid image string.
+     */
     public function fromBlob(mixed $blob): static
     {
         if ($blob instanceof GdImage) {

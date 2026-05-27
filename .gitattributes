@@ -1,5 +1,6 @@
 /.github         export-ignore
 /docs            export-ignore
+/examples        export-ignore
 /tests           export-ignore
 /stubs           export-ignore
 /.gitattributes  export-ignore
@@ -8,3 +9,4 @@
 /phpstan.*       export-ignore
 /phpunit.*       export-ignore
 /README.[Mm][Dd] export-ignore
+/composer.lock   export-ignore
