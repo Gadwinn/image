@@ -1,0 +1,72 @@
+<?php
+
+declare(strict_types=1);
+
+namespace G\Image;
+
+use G\Image\Driver\DriverInterface;
+use G\Image\Factory\ImageFactory;
+use G\Image\Factory\ImageFactoryInterface;
+
+/**
+ * Static facade providing the main entry point of the library.
+ *
+ * Usage:
+ * ```php
+ * use G\Image\Image;
+ * use G\Image\Driver\GDDriver;
+ *
+ * $image = Image::create(GDDriver::class)
+ *     ->fromFile('/path/to/photo.jpg')
+ *     ->resize(800, null)
+ *     ->toWebp(85)
+ *     ->save('/path/to/output.webp');
+ * ```
+ *
+ * A custom factory can be injected (e.g. in tests or DI containers):
+ * ```php
+ * Image::setFactory(new MyCustomFactory());
+ * ```
+ */
+final class Image
+{
+    /** @var ImageFactoryInterface<DriverInterface>|null */
+    private static ?ImageFactoryInterface $factory = null;
+
+    /**
+     * Prevent direct instantiation.
+     */
+    private function __construct()
+    {
+    }
+
+    /**
+     * Override the default {@see ImageFactory} with a custom implementation.
+     *
+     * Useful for dependency injection or test doubles.
+     * Pass null to restore the default factory.
+     *
+     * @param ImageFactoryInterface<DriverInterface>|null $factory Custom factory, or null to reset.
+     */
+    public static function setFactory(?ImageFactoryInterface $factory): void
+    {
+        self::$factory = $factory;
+    }
+
+    /**
+     * Create and return a new driver instance.
+     *
+     * For IDE type-narrowing on the concrete driver type, use
+     * {@see ImageFactory::create()} directly:
+     * ```php
+     * $driver = (new ImageFactory())->create(GDDriver::class); // typed as GDDriver
+     * ```
+     *
+     * @param class-string<DriverInterface> $driverClass Fully qualified driver class name.
+     * @return DriverInterface
+     */
+    public static function create(string $driverClass): DriverInterface
+    {
+        return (self::$factory ?? new ImageFactory())->create($driverClass);
+    }
+}
