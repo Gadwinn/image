@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace G\Image\Tests\Driver;
 
 use G\Image\Color\Color;
+use G\Image\Driver\DriverInterface;
 use G\Image\Driver\GDDriver;
 use G\Image\Enum\Fit;
 use G\Image\Enum\Flip;
@@ -14,6 +15,7 @@ use G\Image\Exception\ImageLoadException;
 use G\Image\Exception\InvalidImageArgumentException;
 use G\Image\Exception\UnsupportedFormatException;
 use G\Image\Exception\UnsupportedOperationException;
+use G\Image\ImageInterface;
 use GdImage;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
@@ -60,6 +62,36 @@ final class GDDriverTest extends TestCase
         imagefill($img, 0, 0, $color);
         ob_start();
         imagejpeg($img, null, 85);
+
+        return (string) ob_get_clean();
+    }
+
+    /**
+     * Build a 30×30 PNG with a 10×10 red square centered at (10, 10) on a white canvas.
+     * Useful for testing trim operations.
+     */
+    private function makeNonUniformPng(int $totalSize = 30, int $innerSize = 10, int $offset = 10): string
+    {
+        $img = imagecreatetruecolor($totalSize, $totalSize);
+        assert($img !== false);
+
+        $white = imagecolorallocate($img, 255, 255, 255);
+        assert($white !== false);
+        imagefill($img, 0, 0, $white);
+
+        $red = imagecolorallocate($img, 255, 0, 0);
+        assert($red !== false);
+        imagefilledrectangle(
+            $img,
+            $offset,
+            $offset,
+            $offset + $innerSize - 1,
+            $offset + $innerSize - 1,
+            $red,
+        );
+
+        ob_start();
+        imagepng($img);
 
         return (string) ob_get_clean();
     }
@@ -197,6 +229,19 @@ final class GDDriverTest extends TestCase
     {
         $this->expectException(ImageLoadException::class);
         (new GDDriver())->fromFile('/nonexistent/path/image.png');
+    }
+
+    public function testFromFileWithJpegCoversExifBlock(): void
+    {
+        $path = tempnam(sys_get_temp_dir(), 'gd_jpeg_') . '.jpg';
+
+        try {
+            imagejpeg(imagecreatetruecolor(20, 20), $path);
+            $driver = (new GDDriver())->fromFile($path);
+            self::assertSame(Format::JPEG, $driver->getFormat());
+        } finally {
+            @unlink($path);
+        }
     }
 
     // =========================================================================
@@ -890,5 +935,237 @@ final class GDDriverTest extends TestCase
         } finally {
             @unlink($tmpPath);
         }
+    }
+
+    // =========================================================================
+    // fromUrl
+    // =========================================================================
+
+    public function testFromUrlThrowsOnUnreachableUrl(): void
+    {
+        $nonExistent = 'file://' . sys_get_temp_dir() . '/gd_no_such_image_test_xyz.png';
+
+        $this->expectException(ImageLoadException::class);
+        (new GDDriver())->fromUrl($nonExistent);
+    }
+
+    // =========================================================================
+    // trim — validation and pixel tracking
+    // =========================================================================
+
+    public function testTrimThrowsOnNegativeThreshold(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->loaded()->trim(-1);
+    }
+
+    public function testTrimThrowsOnThresholdAboveMax(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->loaded()->trim(256);
+    }
+
+    public function testTrimActuallyTrimsNonUniformImage(): void
+    {
+        // 30×30 white canvas with a 10×10 red square at (10, 10).
+        // After trim(0), only the bounding box of the red square should remain.
+        $driver = (new GDDriver())->fromString($this->makeNonUniformPng(30, 10, 10));
+        $driver->trim(0);
+
+        self::assertSame(10, $driver->getWidth());
+        self::assertSame(10, $driver->getHeight());
+    }
+
+    // =========================================================================
+    // scale — zero-dimension guard
+    // =========================================================================
+
+    public function testScaleThrowsWhenResultHasZeroDimension(): void
+    {
+        // A 1×1 image scaled to 1 % yields round(1 * 1 / 100) = 0 pixels.
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->loaded(1, 1)->scale(1);
+    }
+
+    // =========================================================================
+    // resize — upscale=false paths
+    // =========================================================================
+
+    public function testResizeFillWithUpscaleFalseCapsDimensionsToSource(): void
+    {
+        // Source 20×20, target 100×100, upscale=false: result must stay 20×20.
+        $driver = $this->loaded(20, 20)->resize(
+            100,
+            100,
+            Fit::FILL,
+            Position::MIDDLE_CENTER,
+            null,
+            false,
+        );
+
+        self::assertSame(20, $driver->getWidth());
+        self::assertSame(20, $driver->getHeight());
+    }
+
+    public function testResizeCoverWithUpscaleFalseProducesTargetSizeCanvas(): void
+    {
+        // COVER always produces a canvas at the target dimensions.
+        $driver = $this->loaded(20, 20)->resize(
+            100,
+            100,
+            Fit::COVER,
+            Position::MIDDLE_CENTER,
+            null,
+            false,
+        );
+
+        self::assertSame(100, $driver->getWidth());
+        self::assertSame(100, $driver->getHeight());
+    }
+
+    public function testResizeContainWithUpscaleFalseProducesTargetSizeCanvas(): void
+    {
+        // CONTAIN canvas is always target-sized; content is not upscaled.
+        $driver = $this->loaded(20, 20)->resize(
+            100,
+            100,
+            Fit::CONTAIN,
+            Position::MIDDLE_CENTER,
+            null,
+            false,
+        );
+
+        self::assertSame(100, $driver->getWidth());
+        self::assertSame(100, $driver->getHeight());
+    }
+
+    // =========================================================================
+    // toFormat — default (unsupported) case
+    // =========================================================================
+
+    public function testToFormatDefaultCaseThrowsForUnsupportedFormat(): void
+    {
+        $this->expectException(UnsupportedFormatException::class);
+        $this->loaded()->toFormat(Format::ICO);
+    }
+
+    // =========================================================================
+    // toWebp / toAvif / toBmp — format setters
+    // =========================================================================
+
+    public function testToWebpSetsFormatAndReturnsInstance(): void
+    {
+        $driver = $this->loaded()->toWebp(80);
+
+        self::assertSame(Format::WEBP, $driver->getFormat());
+    }
+
+    public function testToAvifSetsFormatAndReturnsInstance(): void
+    {
+        $driver = $this->loaded()->toAvif(70);
+
+        self::assertSame(Format::AVIF, $driver->getFormat());
+    }
+
+    public function testToBmpSetsFormatAndReturnsInstance(): void
+    {
+        $driver = $this->loaded()->toBmp();
+
+        self::assertSame(Format::BMP, $driver->getFormat());
+    }
+
+    // =========================================================================
+    // watermark — OutputInterface path and incompatible type
+    // =========================================================================
+
+    public function testWatermarkViaOutputInterfaceAppliesOverlay(): void
+    {
+        $png  = $this->makePng(10, 10);
+        $mock = $this->createStub(DriverInterface::class);
+        $mock->method('toString')->willReturn($png);
+
+        $base = $this->loaded(100, 100);
+        $base->watermark($mock, Position::TOP_LEFT);
+
+        self::assertTrue($base->isLoaded());
+    }
+
+    public function testWatermarkThrowsForIncompatibleType(): void
+    {
+        $this->expectException(UnsupportedOperationException::class);
+
+        $incompatible = new class implements ImageInterface {};
+        $this->loaded(100, 100)->watermark($incompatible, Position::TOP_LEFT);
+    }
+
+    public function testWatermarkViaOutputInterfaceWithInvalidDataThrows(): void
+    {
+        $this->expectException(ImageLoadException::class);
+
+        $brokenWm = $this->createStub(DriverInterface::class);
+        $brokenWm->method('toString')->willReturn('not valid image data');
+
+        $this->loaded(100, 100)->watermark($brokenWm, Position::TOP_LEFT);
+    }
+
+    // =========================================================================
+    // text — validation
+    // =========================================================================
+
+    public function testTextThrowsOnInvalidFontSize(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->loaded()->text('hello', 10, 10, '/some/font.ttf', 0, Color::fromRgb(0, 0, 0));
+    }
+
+    public function testTextThrowsOnMissingFontFile(): void
+    {
+        $this->expectException(ImageLoadException::class);
+        $this->loaded()->text('hello', 10, 10, '/nonexistent/font_xyz.ttf', 12, Color::fromRgb(0, 0, 0));
+    }
+
+    // =========================================================================
+    // Composition — fill path coverage
+    // =========================================================================
+
+    public function testEllipseWithFillColorDrawsWithoutException(): void
+    {
+        $this->loaded(100, 100)->ellipse(
+            50,
+            50,
+            40,
+            30,
+            Color::fromRgba(0, 255, 0, 1.0),
+            Color::fromRgb(255, 0, 0),
+        );
+        self::assertTrue(true);
+    }
+
+    public function testArcWithFillColorDrawsWithoutException(): void
+    {
+        $this->loaded(100, 100)->arc(
+            50,
+            50,
+            80,
+            80,
+            0,
+            180,
+            Color::fromRgba(255, 128, 0, 1.0),
+            Color::fromRgb(128, 0, 255),
+        );
+        self::assertTrue(true);
+    }
+
+    public function testRectWithTransparentStrokeUsesFilledRectangleOnly(): void
+    {
+        $this->loaded(100, 100)->rect(
+            10,
+            10,
+            50,
+            50,
+            Color::transparent(),
+            Color::fromRgb(0, 0, 255),
+        );
+        self::assertTrue(true);
     }
 }

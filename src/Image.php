@@ -35,6 +35,8 @@ final class Image
 
     /**
      * Prevent direct instantiation.
+     *
+     * @codeCoverageIgnore
      */
     private function __construct()
     {

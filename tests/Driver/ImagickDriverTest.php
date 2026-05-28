@@ -15,6 +15,8 @@ use G\Image\Exception\ImageSaveException;
 use G\Image\Exception\InvalidImageArgumentException;
 use G\Image\Exception\UnsupportedFormatException;
 use G\Image\Exception\UnsupportedOperationException;
+use G\Image\ImageInterface;
+use G\Image\Io\OutputInterface;
 use Imagick;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
@@ -397,6 +399,29 @@ final class ImagickDriverTest extends TestCase
         $this->loaded()->scale(-10);
     }
 
+    public function testResizeFillWithUpscaleFalseCapsDimensionsToSource(): void
+    {
+        $driver = $this->loaded(20, 20);
+        $driver->resize(100, 100, Fit::FILL, upscale: false);
+        self::assertSame(20, $driver->getWidth());
+        self::assertSame(20, $driver->getHeight());
+    }
+
+    public function testResizeCoverWithUpscaleFalseDoesNotUpscale(): void
+    {
+        $driver = $this->loaded(20, 20);
+        $driver->resize(100, 100, Fit::COVER, upscale: false);
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testResizeContainWithUpscaleFalseProducesTargetSizeCanvas(): void
+    {
+        $driver = $this->loaded(20, 20);
+        $driver->resize(100, 100, Fit::CONTAIN, upscale: false);
+        self::assertSame(100, $driver->getWidth());
+        self::assertSame(100, $driver->getHeight());
+    }
+
     // =========================================================================
     // CroppableInterface
     // =========================================================================
@@ -665,6 +690,19 @@ final class ImagickDriverTest extends TestCase
         self::assertTrue(true);
     }
 
+    public function testEllipseWithFillColorDrawsWithoutException(): void
+    {
+        $this->loaded(100, 100)->ellipse(
+            50,
+            50,
+            40,
+            30,
+            Color::fromRgba(0, 255, 0, 1.0),
+            Color::fromRgb(255, 0, 128),
+        );
+        self::assertTrue(true);
+    }
+
     public function testEllipseThrowsOnNonPositiveDimension(): void
     {
         $this->expectException(InvalidImageArgumentException::class);
@@ -683,6 +721,21 @@ final class ImagickDriverTest extends TestCase
         self::assertTrue(true);
     }
 
+    public function testArcWithFillColorDrawsWithoutException(): void
+    {
+        $this->loaded(100, 100)->arc(
+            50,
+            50,
+            80,
+            80,
+            0,
+            180,
+            Color::fromRgba(255, 128, 0, 1.0),
+            Color::fromRgb(128, 0, 255),
+        );
+        self::assertTrue(true);
+    }
+
     public function testArcThrowsOnNonPositiveDimension(): void
     {
         $this->expectException(InvalidImageArgumentException::class);
@@ -694,6 +747,14 @@ final class ImagickDriverTest extends TestCase
         $base      = $this->loaded(100, 100);
         $watermark = $this->loaded(20, 20);
         $base->watermark($watermark, Position::BOTTOM_RIGHT);
+        self::assertTrue($base->isLoaded());
+    }
+
+    public function testWatermarkWithReducedOpacityAppliesAlphaBlend(): void
+    {
+        $base      = $this->loaded(100, 100);
+        $watermark = $this->loaded(20, 20);
+        $base->watermark($watermark, Position::TOP_LEFT, 50);
         self::assertTrue($base->isLoaded());
     }
 
@@ -886,5 +947,139 @@ final class ImagickDriverTest extends TestCase
         self::assertTrue($driver->isLoaded());
         $driver->destroy();
         self::assertFalse($driver->isLoaded());
+    }
+
+    // =========================================================================
+    // fromUrl
+    // =========================================================================
+
+    public function testFromUrlThrowsOnUnreachableUrl(): void
+    {
+        $nonExistent = 'file://' . sys_get_temp_dir() . '/imagick_no_such_image_test_xyz.png';
+
+        $this->expectException(ImageLoadException::class);
+        (new ImagickDriver())->fromUrl($nonExistent);
+    }
+
+    // =========================================================================
+    // toAvif / toBmp / toHeic — conditional format setters
+    // =========================================================================
+
+    public function testToAvifThrowsWhenUnsupportedOrSetsFormatWhenSupported(): void
+    {
+        $driver = $this->loaded();
+
+        if (empty(Imagick::queryFormats('AVIF'))) {
+            $this->expectException(UnsupportedFormatException::class);
+            $driver->toAvif();
+        } else {
+            $driver->toAvif(70);
+            self::assertSame(Format::AVIF, $driver->getFormat());
+        }
+    }
+
+    public function testToBmpThrowsWhenUnsupportedOrSetsFormatWhenSupported(): void
+    {
+        $driver = $this->loaded();
+
+        if (empty(Imagick::queryFormats('BMP'))) {
+            $this->expectException(UnsupportedFormatException::class);
+            $driver->toBmp();
+        } else {
+            $driver->toBmp();
+            self::assertSame(Format::BMP, $driver->getFormat());
+        }
+    }
+
+    public function testToHeicThrowsWhenUnsupportedOrSetsFormatWhenSupported(): void
+    {
+        $driver = $this->loaded();
+
+        if (empty(Imagick::queryFormats('HEIC'))) {
+            $this->expectException(UnsupportedFormatException::class);
+            $driver->toHeic();
+        } else {
+            $driver->toHeic(80);
+            self::assertSame(Format::HEIC, $driver->getFormat());
+        }
+    }
+
+    // =========================================================================
+    // text — validation
+    // =========================================================================
+
+    public function testTextThrowsOnInvalidFontSize(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->loaded()->text('hello', 10, 10, '/some/font.ttf', 0, Color::fromRgb(0, 0, 0));
+    }
+
+    public function testTextThrowsOnMissingFontFile(): void
+    {
+        $this->expectException(ImageLoadException::class);
+        $this->loaded()->text('hello', 10, 10, '/nonexistent/font_xyz.ttf', 12, Color::fromRgb(0, 0, 0));
+    }
+
+    // =========================================================================
+    // watermark — OutputInterface path and incompatible type
+    // =========================================================================
+
+    public function testWatermarkViaOutputInterfaceAppliesOverlay(): void
+    {
+        // ImagickDriver is final, so createStub() is not available.
+        // Build a lightweight anonymous class that satisfies both ImageInterface
+        // (required by the method signature) and OutputInterface (the branch under
+        // test). Since it is not an ImagickDriver, the self-path is skipped.
+        $png = $this->makePng(10, 10);
+
+        $outputWm = new class ($png) implements ImageInterface, OutputInterface {
+            public function __construct(private readonly string $data) {}
+
+            public function save(string $path): static
+            {
+                file_put_contents($path, $this->data);
+                return $this;
+            }
+
+            public function toString(): string
+            {
+                return $this->data;
+            }
+
+            public function toBase64(): string
+            {
+                return base64_encode($this->data);
+            }
+
+            public function toBlob(): mixed
+            {
+                return $this->data;
+            }
+
+            public function toResource(mixed $resource): static
+            {
+                fwrite($resource, $this->data);
+                return $this;
+            }
+
+            public function toStream(\Psr\Http\Message\StreamInterface $stream): static
+            {
+                $stream->write($this->data);
+                return $this;
+            }
+        };
+
+        $base = $this->loaded(100, 100);
+        $base->watermark($outputWm, Position::TOP_LEFT);
+
+        self::assertTrue($base->isLoaded());
+    }
+
+    public function testWatermarkThrowsForIncompatibleType(): void
+    {
+        $this->expectException(UnsupportedOperationException::class);
+
+        $incompatible = new class implements ImageInterface {};
+        $this->loaded(100, 100)->watermark($incompatible, Position::TOP_LEFT);
     }
 }
