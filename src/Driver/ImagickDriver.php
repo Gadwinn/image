@@ -1403,7 +1403,11 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
     /**
      * Enforce the pixel limit from the header of encoded image data, without decoding it.
      *
-     * Uses {@see Imagick::pingImageBlob()}, which reads only the header.
+     * The dimensions are read by PHP itself first (getimagesizefromstring() only
+     * parses the header and knows the common formats), then by
+     * {@see Imagick::pingImageBlob()} for the others: depending on its version
+     * and security policy, ImageMagick may refuse to ping an oversized or
+     * truncated image, which must not hide the limit violation.
      * Silently returns when the header cannot be parsed: the subsequent
      * decode call is responsible for surfacing that failure with a clear message.
      *
@@ -1412,6 +1416,13 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
     private function assertPixelLimitFromHeader(string $data): void
     {
         if ($this->maxPixels === null) {
+            return;
+        }
+
+        [$info] = $this->captureWarning(static fn () => getimagesizefromstring($data));
+        if (is_array($info)) {
+            $this->assertWithinPixelLimit((int) $info[0], (int) $info[1]);
+
             return;
         }
 
