@@ -7,7 +7,7 @@ A single, consistent API regardless of the underlying driver.
 
 | Dependency | Version |
 |---|---|
-| PHP | `^8.2` |
+| PHP | `>=8.3` |
 | `psr/http-message` | `^2.0` |
 | `ext-gd` | Any (for `GDDriver`) |
 | `ext-imagick` | Any (for `ImagickDriver`) |

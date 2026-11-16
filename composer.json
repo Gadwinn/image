@@ -1,6 +1,6 @@
 {
     "name": "gadwinn/image",
-    "description": "",
+    "description": "Fluent image manipulation (resize, crop, compose, watermark, convert) with interchangeable GD and Imagick drivers.",
     "type": "library",
     "minimum-stability": "stable",
     "license": "MIT",
@@ -16,7 +16,7 @@
         }
     },
     "require": {
-        "php": ">=8.2",
+        "php": ">=8.3",
         "psr/http-message": "^2.0"
     },
     "require-dev": {
