@@ -61,26 +61,52 @@ interface CompositionInterface
     /**
      * Render a text string onto the image.
      *
-     * @param string $content  The text to render.
-     * @param int    $x        X coordinate of the text baseline origin.
-     * @param int    $y        Y coordinate of the text baseline origin.
-     * @param string $fontPath Absolute path to a TrueType (.ttf) or OpenType (.otf) font file.
-     * @param int    $fontSize Font size in points (must be positive).
-     * @param Color  $color    Text color.
-     * @param float  $angle    Clockwise rotation angle of the text in degrees.
+     * $content MUST be UTF-8 in every code path, regardless of driver or font.
+     *
+     * $x/$y designate the position of the $anchor point of the rendered text's
+     * bounding box, not a baseline origin. For example, with the default
+     * `Position::TOP_LEFT`, ($x, $y) is the top-left corner of the text box —
+     * matching how {@see self::rect()} already interprets its own $x/$y, so
+     * that neighbouring drawing primitives share one coordinate convention.
+     *
+     * When $fontPath is null, the driver's built-in font is used instead of a
+     * TrueType/OpenType file — this lets simple text rendering work without
+     * shipping a font file. Built-in font support is driver-specific; probe
+     * it via {@see \G\Image\Driver\CapabilityInterface::supportsOperation()}
+     * with the operation key `'text.builtinFont'`. Drivers that do not
+     * support a built-in font throw {@see UnsupportedOperationException} when
+     * $fontPath is null. Drivers that do support one MAY have restrictions —
+     * documented on the implementation — such as a fixed set of sizes, a
+     * limited character range, or no rotation support.
+     *
+     * @param string   $content  The text to render, UTF-8 encoded.
+     * @param int      $x        X coordinate of the $anchor point of the text box.
+     * @param int      $y        Y coordinate of the $anchor point of the text box.
+     * @param ?string  $fontPath Absolute path to a TrueType (.ttf) or OpenType (.otf)
+     *                           font file, or null to use the driver's built-in font.
+     * @param int      $fontSize Font size in points (must be positive).
+     * @param Color    $color    Text color.
+     * @param float    $angle    Clockwise rotation angle of the text in degrees.
+     * @param Position $anchor   Which point of the text's bounding box ($x, $y) designates.
      * @return static
      * @throws ImageLoadException            When the font file cannot be read.
-     * @throws InvalidImageArgumentException When $fontSize is not positive.
-     * @throws UnsupportedOperationException When the active driver does not support text rendering.
+     * @throws InvalidImageArgumentException When $fontSize is not positive, when $content
+     *                                        contains a character the active font cannot
+     *                                        represent, or when $angle is unsupported by
+     *                                        the active font (see implementation docs).
+     * @throws UnsupportedOperationException When the active driver does not support text
+     *                                        rendering, or does not support a built-in font
+     *                                        and $fontPath is null.
      */
     public function text(
         string $content,
         int $x,
         int $y,
-        string $fontPath,
+        ?string $fontPath,
         int $fontSize,
         Color $color,
         float $angle = 0.0,
+        Position $anchor = Position::TOP_LEFT,
     ): static;
 
     /**

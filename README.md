@@ -63,6 +63,10 @@ $driver = Image::create(GDDriver::class); // delegates to $myCustomFactory
 
 // Reset to the default factory
 Image::setFactory(null);
+
+// First available driver — no extension_loaded() check needed by the caller
+$driver = Image::createFirstAvailable([GDDriver::class, ImagickDriver::class]);
+// throws UnsupportedOperationException when none of the candidates is available
 ```
 
 ### Format support matrix
@@ -90,8 +94,14 @@ Image::setFactory(null);
 ```php
 use G\Image\Image;
 use G\Image\Driver\GDDriver;
+use G\Image\Color\Color;
 
 $driver = Image::create(GDDriver::class);
+
+// A blank canvas — null background is fully transparent (both drivers support alpha);
+// getFormat() on a blank canvas is Format::PNG until a to*() call changes it
+$driver->fromBlank(400, 300);
+$driver->fromBlank(400, 300, Color::fromHex('#1a1a2e'));
 
 // From a filesystem path
 $driver->fromFile('/path/to/image.jpg');
@@ -119,6 +129,33 @@ $driver->fromStream($psrStream);
 ```
 
 All `from*` methods return `static` for fluent chaining.
+
+### Guarding against oversized uploads
+
+`limitPixels()` is opt-in and off by default — no hardcoded ceiling, so
+legitimately huge images keep working for consumers that don't call it.
+When set, it inspects the image *header* before decoding (never the fully
+decoded image), so the check can actually prevent the memory spike instead
+of running after it already happened.
+
+```php
+use G\Image\Exception\ImageLimitExceededException;
+
+try {
+    Image::create(GDDriver::class)
+        ->limitPixels(200_000_000) // width × height, checked before decode
+        ->fromFile($upload);
+} catch (ImageLimitExceededException $e) {
+    // rejected based on header inspection alone — nothing was decoded
+}
+```
+
+`fromResource()`/`fromStream()` buffer their input before decoding, so the
+same header check applies there too. The only case it cannot cover is
+`fromBlob()` given an already-decoded native object (`GdImage`/`Imagick`) —
+the memory is already allocated by the caller at that point; the limit is
+still enforced against the object's existing dimensions, it just can't
+prevent an allocation that already happened.
 
 ---
 
@@ -289,7 +326,8 @@ $watermark = Image::create(GDDriver::class)->fromFile('/path/to/logo.png');
 $driver->watermark($watermark, Position::BOTTOM_RIGHT);
 $driver->watermark($watermark, Position::BOTTOM_RIGHT, opacity: 60); // 0–100
 
-// Text (requires a TrueType or OpenType font file)
+// Text — $x/$y is the position of the $anchor point of the text box (TOP_LEFT by
+// default, matching rect()'s own $x/$y convention), not a baseline origin
 $driver->text(
     content: 'Hello World',
     x: 20,
@@ -298,6 +336,31 @@ $driver->text(
     fontSize: 24,
     color: Color::fromRgba(255, 255, 255, 0.9),
     angle: 0.0,
+);
+
+// Centred text on a 400×300 canvas — anchor the middle of the text box to the
+// canvas's own center point
+$driver->text(
+    content: 'Hello World',
+    x: 200,
+    y: 150,
+    fontPath: '/fonts/Roboto-Bold.ttf',
+    fontSize: 24,
+    color: Color::fromHex('#ffffff'),
+    anchor: Position::MIDDLE_CENTER,
+);
+
+// No font file needed — GDDriver has a built-in bitmap font (ImagickDriver
+// throws UnsupportedOperationException; probe with supportsOperation('text.builtinFont')).
+// Fixed sizes only (fontSize snaps to GD's nearest of 5), ISO-8859-1 range only
+// (throws InvalidImageArgumentException on unrepresentable characters), no rotation.
+$driver->text(
+    content: 'Thumbnail',
+    x: 10,
+    y: 10,
+    fontPath: null,
+    fontSize: 16,
+    color: Color::fromHex('#000000'),
 );
 
 // Rectangle (stroke + optional fill)
@@ -395,6 +458,22 @@ if ($driver->supportsOperation('toHeic')) {
 $formats = $driver->getSupportedFormats();
 ```
 
+### Operation capability table (driver-specific asymmetries)
+
+Most operations are supported identically by both drivers. The exceptions:
+
+| Operation key         | GDDriver | ImagickDriver | Notes |
+|------------------------|:--------:|:-------------:|---|
+| `text.builtinFont`     | ✓ | ✗ | GD: `text()` with `fontPath: null` uses a built-in bitmap font. Imagick throws `UnsupportedOperationException` when `fontPath` is null — a TTF/OTF file is always required. |
+| `toTiff`, `toHeic`     | ✗ | ✓ | GD has no TIFF/HEIC encoder. |
+
+Static driver availability (before an instance exists) is a separate check:
+
+```php
+GDDriver::isAvailable();      // bool — extension_loaded('gd')
+ImagickDriver::isAvailable(); // bool — extension_loaded('imagick')
+```
+
 ---
 
 ## Pipeline Branching
@@ -483,6 +562,7 @@ ImageExceptionInterface
 ├── ImageException (RuntimeException)          — environmental failures
 │   ├── ImageLoadException                     — cannot load source
 │   ├── ImageSaveException                     — cannot encode / write
+│   ├── ImageLimitExceededException            — decoded image would exceed limitPixels()
 │   ├── UnsupportedFormatException             — format not available in current driver
 │   └── UnsupportedOperationException          — operation not available in current driver
 └── ImageLogicException (LogicException)       — programming errors

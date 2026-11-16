@@ -11,7 +11,9 @@ use G\Image\Enum\Fit;
 use G\Image\Enum\Flip;
 use G\Image\Enum\Format;
 use G\Image\Enum\Position;
+use G\Image\Exception\ImageLimitExceededException;
 use G\Image\Exception\ImageLoadException;
+use G\Image\Exception\ImageSaveException;
 use G\Image\Exception\InvalidImageArgumentException;
 use G\Image\Exception\UnsupportedFormatException;
 use G\Image\Exception\UnsupportedOperationException;
@@ -1167,5 +1169,311 @@ final class GDDriverTest extends TestCase
             Color::fromRgb(0, 0, 255),
         );
         self::assertTrue(true);
+    }
+
+    // =========================================================================
+    // DriverAvailabilityInterface
+    // =========================================================================
+
+    public function testIsAvailableReturnsTrueWhenGdIsLoaded(): void
+    {
+        self::assertTrue(GDDriver::isAvailable());
+    }
+
+    // =========================================================================
+    // fromBlank
+    // =========================================================================
+
+    public function testFromBlankCreatesLoadedPngCanvas(): void
+    {
+        $driver = (new GDDriver())->fromBlank(40, 30);
+
+        self::assertTrue($driver->isLoaded());
+        self::assertSame(40, $driver->getWidth());
+        self::assertSame(30, $driver->getHeight());
+        self::assertSame(Format::PNG, $driver->getFormat());
+    }
+
+    public function testFromBlankWithNullBackgroundIsFullyTransparent(): void
+    {
+        $driver = (new GDDriver())->fromBlank(10, 10);
+        $image  = $driver->toBlob();
+        self::assertInstanceOf(GdImage::class, $image);
+
+        $rgba = imagecolorat($image, 5, 5);
+        $alpha = ($rgba >> 24) & 0x7F;
+        self::assertSame(127, $alpha); // GD alpha 127 = fully transparent
+    }
+
+    public function testFromBlankWithBackgroundFillsCanvas(): void
+    {
+        $driver = (new GDDriver())->fromBlank(10, 10, Color::fromRgb(255, 0, 0));
+        $image  = $driver->toBlob();
+        self::assertInstanceOf(GdImage::class, $image);
+
+        $rgba = imagecolorat($image, 5, 5);
+        self::assertSame(255, ($rgba >> 16) & 0xFF); // red channel
+    }
+
+    public function testFromBlankThrowsOnZeroWidth(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        (new GDDriver())->fromBlank(0, 10);
+    }
+
+    public function testFromBlankThrowsOnNegativeHeight(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        (new GDDriver())->fromBlank(10, -5);
+    }
+
+    public function testFromBlankAllowsDrawingOperations(): void
+    {
+        $driver = (new GDDriver())->fromBlank(50, 50);
+        $driver->rect(5, 5, 20, 20, Color::fromRgb(0, 0, 0), Color::fromRgb(0, 255, 0));
+        self::assertTrue($driver->isLoaded());
+    }
+
+    // =========================================================================
+    // text — nullable font (built-in font support) and anchoring
+    // =========================================================================
+
+    public function testSupportsBuiltinFontOperation(): void
+    {
+        self::assertTrue((new GDDriver())->supportsOperation('text.builtinFont'));
+    }
+
+    public function testTextWithNullFontPathUsesBuiltinFont(): void
+    {
+        $driver = $this->loaded(100, 50);
+        $driver->text('Hello', 10, 10, null, 12, Color::fromRgb(0, 0, 0));
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testTextWithNullFontPathAndNonZeroAngleThrows(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->loaded(100, 50)->text('Hello', 10, 10, null, 12, Color::fromRgb(0, 0, 0), angle: 45.0);
+    }
+
+    public function testTextWithNullFontPathThrowsOnUnrepresentableCharacter(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        // U+20AC (€) is outside ISO-8859-1's representable range.
+        $this->loaded(100, 50)->text('€', 10, 10, null, 12, Color::fromRgb(0, 0, 0));
+    }
+
+    public function testTextWithNullFontPathAccentedCharacterIsCenteredCorrectly(): void
+    {
+        // Regression guard for the "measure before converting" ordering trap:
+        // if the built-in font conversion happened after measurement, the byte
+        // count used for centering would be wrong for a UTF-8 multi-byte string
+        // and the rendered pixels would land at a different X than expected.
+        $driver = (new GDDriver())->fromBlank(100, 40);
+        $driver->text('é', 50, 20, null, 12, Color::fromRgb(255, 255, 255), anchor: Position::MIDDLE_CENTER);
+
+        $plainDriver = (new GDDriver())->fromBlank(100, 40);
+        $plainDriver->text('e', 50, 20, null, 12, Color::fromRgb(255, 255, 255), anchor: Position::MIDDLE_CENTER);
+
+        // Both are single-glyph built-in font renders of the same width class;
+        // their leftmost lit pixel column must match if centering used the
+        // correctly-converted (1-byte) string length rather than the raw
+        // UTF-8 byte length of 'é' (2 bytes).
+        $accentedImage = $driver->toBlob();
+        $plainImage    = $plainDriver->toBlob();
+        self::assertInstanceOf(GdImage::class, $accentedImage);
+        self::assertInstanceOf(GdImage::class, $plainImage);
+
+        self::assertSame(
+            $this->leftmostLitColumn($plainImage, 100, 40),
+            $this->leftmostLitColumn($accentedImage, 100, 40),
+        );
+    }
+
+    /**
+     * Find the leftmost X coordinate at which a non-transparent pixel appears.
+     */
+    private function leftmostLitColumn(GdImage $image, int $width, int $height): int
+    {
+        for ($x = 0; $x < $width; $x++) {
+            for ($y = 0; $y < $height; $y++) {
+                $rgba  = imagecolorat($image, $x, $y);
+                $alpha = ($rgba >> 24) & 0x7F;
+                if ($alpha < 127) {
+                    return $x;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    public function testTextWithFontFileAndAnchorMiddleCenterRendersWithoutException(): void
+    {
+        $fontPath = $this->findSystemTtfFont();
+        if ($fontPath === null) {
+            $this->markTestSkipped('No TrueType font file found on this system.');
+        }
+
+        $driver = $this->loaded(200, 100);
+        $driver->text(
+            'Hi',
+            100,
+            50,
+            $fontPath,
+            16,
+            Color::fromRgb(0, 0, 0),
+            anchor: Position::MIDDLE_CENTER,
+        );
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testTextDefaultAnchorIsTopLeft(): void
+    {
+        $fontPath = $this->findSystemTtfFont();
+        if ($fontPath === null) {
+            $this->markTestSkipped('No TrueType font file found on this system.');
+        }
+
+        // Rendered near the top-left corner with the default anchor must not throw
+        // even though the text would overflow a bottom/right anchored box at (2, 2).
+        $driver = $this->loaded(200, 100);
+        $driver->text('Hi', 2, 2, $fontPath, 16, Color::fromRgb(0, 0, 0));
+        self::assertTrue($driver->isLoaded());
+    }
+
+    /**
+     * Locate a TrueType font file available on the current system, if any.
+     */
+    private function findSystemTtfFont(): ?string
+    {
+        $candidates = [
+            'C:\\Windows\\Fonts\\arial.ttf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
+        ];
+
+        foreach ($candidates as $candidate) {
+            if (is_file($candidate) && is_readable($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    // =========================================================================
+    // PixelLimitInterface
+    // =========================================================================
+
+    public function testLimitPixelsIsInactiveByDefault(): void
+    {
+        // A tiny image must load fine when no limit has been configured.
+        $driver = (new GDDriver())->fromString($this->makePng(500, 500));
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testLimitPixelsThrowsOnInvalidValue(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        (new GDDriver())->limitPixels(0);
+    }
+
+    public function testLimitPixelsAllowsNullToDisable(): void
+    {
+        $driver = (new GDDriver())->limitPixels(100)->limitPixels(null);
+        $driver->fromString($this->makePng(50, 50)); // 2500 px, would exceed 100
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testLimitPixelsRejectsFromStringBasedOnHeaderWithoutDecoding(): void
+    {
+        // 50000×50000 header, but no real pixel data behind it: if the guard
+        // decoded the image first, it would run out of memory / fail with a
+        // decode error instead of a clean ImageLimitExceededException.
+        $data = $this->buildTruncatedPngWithHeaderOnly(50000, 50000);
+
+        $this->expectException(ImageLimitExceededException::class);
+        (new GDDriver())->limitPixels(1_000_000)->fromString($data);
+    }
+
+    public function testLimitPixelsRejectsFromFileBasedOnHeaderWithoutDecoding(): void
+    {
+        $data = $this->buildTruncatedPngWithHeaderOnly(50000, 50000);
+        $path = tempnam(sys_get_temp_dir(), 'gd_limit_') . '.png';
+        file_put_contents($path, $data);
+
+        try {
+            $this->expectException(ImageLimitExceededException::class);
+            (new GDDriver())->limitPixels(1_000_000)->fromFile($path);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testLimitPixelsAllowsImageUnderTheLimit(): void
+    {
+        $driver = (new GDDriver())->limitPixels(1_000_000)->fromString($this->makePng(100, 100));
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testLimitPixelsRejectsAlreadyDecodedGdImageViaFromBlob(): void
+    {
+        // The image is already fully decoded when handed to fromBlob(): the
+        // guard cannot prevent the earlier memory allocation, but it must
+        // still refuse to proceed with an object that violates the configured limit.
+        $gdImage = imagecreatefromstring($this->makePng(200, 200));
+        self::assertInstanceOf(GdImage::class, $gdImage);
+
+        $this->expectException(ImageLimitExceededException::class);
+        (new GDDriver())->limitPixels(1_000)->fromBlob($gdImage);
+    }
+
+    public function testLimitPixelsRejectsFromBlankExceedingTheLimit(): void
+    {
+        // No header to inspect here — the guard checks width × height directly.
+        $this->expectException(ImageLimitExceededException::class);
+        (new GDDriver())->limitPixels(1_000)->fromBlank(50, 50); // 2500 px
+    }
+
+    /**
+     * Build a well-formed PNG signature + IHDR chunk announcing $width×$height,
+     * with no IDAT data behind it — parseable by getimagesizefromstring(),
+     * but guaranteed to fail a full imagecreatefromstring() decode.
+     */
+    private function buildTruncatedPngWithHeaderOnly(int $width, int $height): string
+    {
+        $signature = "\x89PNG\r\n\x1a\n";
+        $ihdrData  = pack('NN', $width, $height) . pack('C5', 8, 6, 0, 0, 0);
+        $crc       = crc32('IHDR' . $ihdrData);
+        $ihdrChunk = pack('N', strlen($ihdrData)) . 'IHDR' . $ihdrData . pack('N', $crc);
+
+        return $signature . $ihdrChunk;
+    }
+
+    // =========================================================================
+    // Native warning capture — enriched exception messages
+    // =========================================================================
+
+    public function testSaveThrowsWithEnrichedMessageWhenDirectoryDoesNotExist(): void
+    {
+        $this->expectException(ImageSaveException::class);
+        $this->loaded()->toPng()->save('/nonexistent/directory/xyz/output.png');
+    }
+
+    public function testFromFileWithNoExifDataDoesNotThrow(): void
+    {
+        // exif_read_data() warns routinely when there is no EXIF segment; this
+        // must never surface as a failure — the warning is captured and discarded.
+        $path = tempnam(sys_get_temp_dir(), 'gd_no_exif_') . '.jpg';
+        imagejpeg(imagecreatetruecolor(10, 10), $path);
+
+        try {
+            $driver = (new GDDriver())->fromFile($path);
+            self::assertTrue($driver->isLoaded());
+            self::assertIsArray($driver->getExif());
+        } finally {
+            @unlink($path);
+        }
     }
 }

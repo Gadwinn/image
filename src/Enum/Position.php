@@ -65,4 +65,58 @@ enum Position: string
 
         return [$x, $y];
     }
+
+    /**
+     * Resolve the drawing origin so that this anchor point of a box measuring
+     * ($minX, $minY)-($maxX, $maxY) relative to its own natural drawing origin
+     * lands exactly at ($anchorX, $anchorY).
+     *
+     * Unlike {@see self::toOffset()} (which positions an element inside a
+     * container), this positions a box around a single target point — the
+     * use case for anchored text, where ($anchorX, $anchorY) is supplied by
+     * the caller and the box extents come from a font metrics measurement.
+     *
+     * $minX/$minY/$maxX/$maxY are expressed relative to the box's own natural
+     * origin (e.g. (0, 0)-(width, height) for a top-left-origin box such as
+     * GD's built-in bitmap fonts, or a font engine's bounding box relative to
+     * a baseline origin for TrueType/OpenType text).
+     *
+     * @param float $anchorX Target X coordinate for this anchor point.
+     * @param float $anchorY Target Y coordinate for this anchor point.
+     * @param float $minX    Left extent of the box relative to its natural origin.
+     * @param float $minY    Top extent of the box relative to its natural origin.
+     * @param float $maxX    Right extent of the box relative to its natural origin.
+     * @param float $maxY    Bottom extent of the box relative to its natural origin.
+     * @return array{0: float, 1: float} [originX, originY] to use as the box's natural drawing origin.
+     */
+    public function toAnchorOrigin(
+        float $anchorX,
+        float $anchorY,
+        float $minX,
+        float $minY,
+        float $maxX,
+        float $maxY,
+    ): array {
+        $originX = match ($this) {
+            self::TOP_LEFT,
+            self::MIDDLE_LEFT,
+            self::BOTTOM_LEFT   => $anchorX - $minX,
+            self::TOP_RIGHT,
+            self::MIDDLE_RIGHT,
+            self::BOTTOM_RIGHT  => $anchorX - $maxX,
+            default             => $anchorX - ($minX + $maxX) / self::CENTER_DIVISOR,
+        };
+
+        $originY = match ($this) {
+            self::TOP_LEFT,
+            self::TOP_CENTER,
+            self::TOP_RIGHT    => $anchorY - $minY,
+            self::BOTTOM_LEFT,
+            self::BOTTOM_CENTER,
+            self::BOTTOM_RIGHT => $anchorY - $maxY,
+            default            => $anchorY - ($minY + $maxY) / self::CENTER_DIVISOR,
+        };
+
+        return [$originX, $originY];
+    }
 }

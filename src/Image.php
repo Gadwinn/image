@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace G\Image;
 
+use G\Image\Driver\DriverAvailabilityInterface;
 use G\Image\Driver\DriverInterface;
+use G\Image\Exception\UnsupportedOperationException;
 use G\Image\Factory\ImageFactory;
 use G\Image\Factory\ImageFactoryInterface;
 
@@ -70,5 +72,40 @@ final class Image
     public static function create(string $driverClass): DriverInterface
     {
         return (self::$factory ?? new ImageFactory())->create($driverClass);
+    }
+
+    /**
+     * Create the first available driver from an ordered list of candidates.
+     *
+     * Each class is checked via its {@see DriverAvailabilityInterface::isAvailable()}
+     * static method before being instantiated, so a consumer never needs to
+     * duplicate a driver's own extension-loaded check (e.g. `extension_loaded('gd')`).
+     *
+     * ```php
+     * $image = Image::createFirstAvailable([GDDriver::class, ImagickDriver::class])
+     *     ->fromFile($upload);
+     * ```
+     *
+     * @param list<class-string<DriverInterface>> $driverClasses Ordered candidates, tried in order.
+     * @return DriverInterface The first available driver, instantiated.
+     * @throws UnsupportedOperationException When none of the candidates is available.
+     */
+    public static function createFirstAvailable(array $driverClasses): DriverInterface
+    {
+        foreach ($driverClasses as $driverClass) {
+            $isAvailable = is_a($driverClass, DriverAvailabilityInterface::class, allow_string: true)
+                && $driverClass::isAvailable();
+
+            if ($isAvailable) {
+                return self::create($driverClass);
+            }
+        }
+
+        throw new UnsupportedOperationException(
+            sprintf(
+                'None of the candidate drivers is available on this system: %s.',
+                implode(', ', $driverClasses),
+            )
+        );
     }
 }
