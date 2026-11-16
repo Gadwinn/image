@@ -10,6 +10,7 @@ use G\Image\Enum\Fit;
 use G\Image\Enum\Flip;
 use G\Image\Enum\Format;
 use G\Image\Enum\Position;
+use G\Image\Exception\ImageLimitExceededException;
 use G\Image\Exception\ImageLoadException;
 use G\Image\Exception\ImageSaveException;
 use G\Image\Exception\InvalidImageArgumentException;
@@ -1081,5 +1082,235 @@ final class ImagickDriverTest extends TestCase
 
         $incompatible = new class implements ImageInterface {};
         $this->loaded(100, 100)->watermark($incompatible, Position::TOP_LEFT);
+    }
+
+    // =========================================================================
+    // DriverAvailabilityInterface
+    // =========================================================================
+
+    public function testIsAvailableReturnsTrueWhenImagickIsLoaded(): void
+    {
+        self::assertTrue(ImagickDriver::isAvailable());
+    }
+
+    // =========================================================================
+    // fromBlank
+    // =========================================================================
+
+    public function testFromBlankCreatesLoadedPngCanvas(): void
+    {
+        $driver = (new ImagickDriver())->fromBlank(40, 30);
+
+        self::assertTrue($driver->isLoaded());
+        self::assertSame(40, $driver->getWidth());
+        self::assertSame(30, $driver->getHeight());
+        self::assertSame(Format::PNG, $driver->getFormat());
+    }
+
+    public function testFromBlankWithNullBackgroundIsFullyTransparent(): void
+    {
+        $driver  = (new ImagickDriver())->fromBlank(10, 10);
+        $imagick = $driver->toBlob();
+        self::assertInstanceOf(Imagick::class, $imagick);
+
+        $pixel = $imagick->getImagePixelColor(5, 5);
+        self::assertSame(0.0, $pixel->getColorValue(Imagick::COLOR_ALPHA));
+    }
+
+    public function testFromBlankWithBackgroundFillsCanvas(): void
+    {
+        $driver  = (new ImagickDriver())->fromBlank(10, 10, Color::fromRgb(255, 0, 0));
+        $imagick = $driver->toBlob();
+        self::assertInstanceOf(Imagick::class, $imagick);
+
+        $pixel = $imagick->getImagePixelColor(5, 5);
+        self::assertSame(255, $pixel->getColor()['r']);
+    }
+
+    public function testFromBlankThrowsOnZeroWidth(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        (new ImagickDriver())->fromBlank(0, 10);
+    }
+
+    public function testFromBlankThrowsOnNegativeHeight(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        (new ImagickDriver())->fromBlank(10, -5);
+    }
+
+    public function testFromBlankAllowsDrawingOperations(): void
+    {
+        $driver = (new ImagickDriver())->fromBlank(50, 50);
+        $driver->rect(5, 5, 20, 20, Color::fromRgb(0, 0, 0), Color::fromRgb(0, 255, 0));
+        self::assertTrue($driver->isLoaded());
+    }
+
+    // =========================================================================
+    // text — nullable font (unsupported for Imagick) and anchoring
+    // =========================================================================
+
+    public function testDoesNotSupportBuiltinFontOperation(): void
+    {
+        self::assertFalse((new ImagickDriver())->supportsOperation('text.builtinFont'));
+    }
+
+    public function testTextWithNullFontPathThrowsUnsupportedOperationException(): void
+    {
+        $this->expectException(UnsupportedOperationException::class);
+        $this->loaded(100, 50)->text('Hello', 10, 10, null, 12, Color::fromRgb(0, 0, 0));
+    }
+
+    public function testTextWithAnchorMiddleCenterRendersWithoutException(): void
+    {
+        $fontPath = $this->findSystemTtfFont();
+        if ($fontPath === null) {
+            $this->markTestSkipped('No TrueType font file found on this system.');
+        }
+
+        $driver = $this->loaded(200, 100);
+        $driver->text(
+            'Hi',
+            100,
+            50,
+            $fontPath,
+            16,
+            Color::fromRgb(0, 0, 0),
+            anchor: Position::MIDDLE_CENTER,
+        );
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testTextDefaultAnchorIsTopLeft(): void
+    {
+        $fontPath = $this->findSystemTtfFont();
+        if ($fontPath === null) {
+            $this->markTestSkipped('No TrueType font file found on this system.');
+        }
+
+        $driver = $this->loaded(200, 100);
+        $driver->text('Hi', 2, 2, $fontPath, 16, Color::fromRgb(0, 0, 0));
+        self::assertTrue($driver->isLoaded());
+    }
+
+    /**
+     * Locate a TrueType font file available on the current system, if any.
+     */
+    private function findSystemTtfFont(): ?string
+    {
+        $candidates = [
+            'C:\\Windows\\Fonts\\arial.ttf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
+        ];
+
+        foreach ($candidates as $candidate) {
+            if (is_file($candidate) && is_readable($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    // =========================================================================
+    // PixelLimitInterface
+    // =========================================================================
+
+    public function testLimitPixelsIsInactiveByDefault(): void
+    {
+        $driver = (new ImagickDriver())->fromString($this->makePng(500, 500));
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testLimitPixelsThrowsOnInvalidValue(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        (new ImagickDriver())->limitPixels(0);
+    }
+
+    public function testLimitPixelsAllowsNullToDisable(): void
+    {
+        $driver = (new ImagickDriver())->limitPixels(100)->limitPixels(null);
+        $driver->fromString($this->makePng(50, 50)); // 2500 px, would exceed 100
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testLimitPixelsRejectsFromStringBasedOnHeaderWithoutDecoding(): void
+    {
+        // 50000×50000 header, but no real pixel data behind it: pingImageBlob()
+        // only reads the header, so this must fail cleanly with our exception
+        // rather than attempting (and failing) a full decode.
+        $data = $this->buildTruncatedPngWithHeaderOnly(50000, 50000);
+
+        $this->expectException(ImageLimitExceededException::class);
+        (new ImagickDriver())->limitPixels(1_000_000)->fromString($data);
+    }
+
+    public function testLimitPixelsRejectsFromFileBasedOnHeaderWithoutDecoding(): void
+    {
+        $data = $this->buildTruncatedPngWithHeaderOnly(50000, 50000);
+        $path = tempnam(sys_get_temp_dir(), 'imagick_limit_') . '.png';
+        file_put_contents($path, $data);
+
+        try {
+            $this->expectException(ImageLimitExceededException::class);
+            (new ImagickDriver())->limitPixels(1_000_000)->fromFile($path);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testLimitPixelsAllowsImageUnderTheLimit(): void
+    {
+        $driver = (new ImagickDriver())->limitPixels(1_000_000)->fromString($this->makePng(100, 100));
+        self::assertTrue($driver->isLoaded());
+    }
+
+    public function testLimitPixelsRejectsAlreadyDecodedImagickViaFromBlob(): void
+    {
+        // The image is already fully decoded when handed to fromBlob(): the
+        // guard cannot prevent the earlier memory allocation, but it must
+        // still refuse to proceed with an object that violates the configured limit.
+        $imagick = new Imagick();
+        $imagick->readImageBlob($this->makePng(200, 200));
+
+        $this->expectException(ImageLimitExceededException::class);
+        (new ImagickDriver())->limitPixels(1_000)->fromBlob($imagick);
+    }
+
+    public function testLimitPixelsRejectsFromBlankExceedingTheLimit(): void
+    {
+        // No header to inspect here — the guard checks width × height directly.
+        $this->expectException(ImageLimitExceededException::class);
+        (new ImagickDriver())->limitPixels(1_000)->fromBlank(50, 50); // 2500 px
+    }
+
+    /**
+     * Build a well-formed PNG signature + IHDR chunk announcing $width×$height,
+     * with a corrupt/truncated IDAT — parseable by pingImageBlob() (header only,
+     * which never reads past IHDR), but guaranteed to fail a full readImageBlob() decode.
+     */
+    private function buildTruncatedPngWithHeaderOnly(int $width, int $height): string
+    {
+        $chunk = static fn (string $type, string $data): string => pack('N', strlen($data))
+            . $type . $data . pack('N', crc32($type . $data));
+
+        $signature = "\x89PNG\r\n\x1a\n";
+        $ihdrChunk = $chunk('IHDR', pack('NN', $width, $height) . pack('C5', 8, 6, 0, 0, 0));
+        $idatChunk = $chunk('IDAT', "\x78\x9c\x00\x00"); // deliberately incomplete zlib stream
+        $iendChunk = $chunk('IEND', '');
+
+        return $signature . $ihdrChunk . $idatChunk . $iendChunk;
+    }
+
+    // =========================================================================
+    // Native warning capture — enriched exception messages
+    // =========================================================================
+
+    public function testSaveThrowsWithEnrichedMessageWhenDirectoryDoesNotExist(): void
+    {
+        $this->expectException(ImageSaveException::class);
+        $this->loaded()->toPng()->save('/nonexistent/directory/xyz/output.png');
     }
 }

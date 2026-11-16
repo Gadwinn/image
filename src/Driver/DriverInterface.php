@@ -9,6 +9,7 @@ use G\Image\Composition\CompositionInterface;
 use G\Image\ImageInterface;
 use G\Image\Io\InputInterface;
 use G\Image\Io\OutputInterface;
+use G\Image\Io\PixelLimitInterface;
 use G\Image\Metadata\MetadataInterface;
 use G\Image\Operation\ConvertibleInterface;
 use G\Image\Operation\CroppableInterface;
@@ -23,7 +24,7 @@ use G\Image\Operation\TransformableInterface;
  * every capability of the library into a single fluent API:
  *
  *  - Identity    : {@see ImageInterface} — marks the object as a compositable image
- *  - I/O         : {@see InputInterface}, {@see OutputInterface}
+ *  - I/O         : {@see InputInterface}, {@see OutputInterface}, {@see PixelLimitInterface}
  *  - Operations  : {@see ResizableInterface}, {@see CroppableInterface},
  *                  {@see TransformableInterface}, {@see FilterableInterface},
  *                  {@see ConvertibleInterface}
@@ -32,6 +33,9 @@ use G\Image\Operation\TransformableInterface;
  *  - Animation   : {@see AnimatableInterface}
  *  - Introspection: {@see CapabilityInterface}
  *  - Lifecycle   : {@see ImageStateInterface}
+ *
+ * Static driver availability (before an instance can even be constructed) is
+ * a separate contract: {@see DriverAvailabilityInterface}.
  *
  * Drivers are instantiated through {@see \G\Image\Factory\ImageFactoryInterface}
  * or the static facade {@see \G\Image\Factory\Image}.
@@ -49,6 +53,7 @@ interface DriverInterface extends
     ImageInterface,
     InputInterface,
     OutputInterface,
+    PixelLimitInterface,
     ResizableInterface,
     CroppableInterface,
     TransformableInterface,
