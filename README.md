@@ -588,3 +588,7 @@ try {
     // any other library exception
 }
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
