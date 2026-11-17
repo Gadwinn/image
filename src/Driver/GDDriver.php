@@ -9,6 +9,7 @@ use G\Image\Enum\Fit;
 use G\Image\Enum\Flip;
 use G\Image\Enum\Format;
 use G\Image\Enum\Position;
+use G\Image\Exception\ImageLimitExceededException;
 use G\Image\Exception\ImageLoadException;
 use G\Image\Exception\ImageSaveException;
 use G\Image\Exception\InvalidImageArgumentException;
@@ -31,8 +32,10 @@ use Psr\Http\Message\StreamInterface;
  * {@see UnsupportedOperationException}.
  * EXIF: readable for JPEG on load; writing throws {@see UnsupportedOperationException}.
  */
-final class GDDriver implements DriverInterface
+final class GDDriver implements DriverInterface, DriverAvailabilityInterface
 {
+    use CapturesNativeWarnings;
+
     // ─── GD alpha (0 = opaque, 127 = transparent) ─────────────────────────────
     private const GD_ALPHA_TRANSPARENT = 127;
 
@@ -67,14 +70,22 @@ final class GDDriver implements DriverInterface
     // ─── HTTP fetch timeout (seconds) ─────────────────────────────────────────
     private const HTTP_TIMEOUT = 10;
 
+    // ─── Built-in bitmap font index range (imagestring/imagefontwidth/height) ─
+    private const BUILTIN_FONT_MIN = 1;
+    private const BUILTIN_FONT_MAX = 5;
+
+    // ─── Highest Unicode code point representable in ISO-8859-1 ───────────────
+    private const LATIN1_MAX_CODEPOINT = 0xFF;
+
     // ─── Operations supported by this driver ──────────────────────────────────
     private const SUPPORTED_OPERATIONS = [
+        'fromBlank',
         'resize', 'scale',
         'crop', 'trim',
         'rotate', 'flip',
         'blur', 'sharpen', 'brightness', 'contrast', 'grayscale', 'negate', 'sepia', 'emboss',
         'toJpeg', 'toPng', 'toWebp', 'toAvif', 'toGif', 'toBmp', 'toFormat',
-        'watermark', 'text', 'rect', 'ellipse', 'line', 'arc',
+        'watermark', 'text', 'text.builtinFont', 'rect', 'ellipse', 'line', 'arc',
         'getWidth', 'getHeight', 'getFormat', 'getExif', 'getIptc', 'stripMetadata',
         'getFrameCount', 'getFrames', 'getFrame', 'getFrameDelay', 'getLoopCount',
         'isLoaded', 'copy', 'destroy',
@@ -87,6 +98,8 @@ final class GDDriver implements DriverInterface
     private Format $format = Format::JPEG;
 
     private ?int $quality = null;
+
+    private ?int $maxPixels = null;
 
     /** @var array<string, mixed> */
     private array $exif = [];
@@ -108,9 +121,49 @@ final class GDDriver implements DriverInterface
         }
     }
 
+    public static function isAvailable(): bool
+    {
+        return extension_loaded('gd');
+    }
+
+    // =========================================================================
+    // PixelLimitInterface
+    // =========================================================================
+
+    public function limitPixels(?int $maxPixels): static
+    {
+        if ($maxPixels !== null && $maxPixels <= 0) {
+            throw new InvalidImageArgumentException(
+                'Pixel limit must be a positive integer, or null to disable it.'
+            );
+        }
+
+        $this->maxPixels = $maxPixels;
+
+        return $this;
+    }
+
     // =========================================================================
     // InputInterface
     // =========================================================================
+
+    public function fromBlank(int $width, int $height, ?Color $background = null): static
+    {
+        if ($width <= 0 || $height <= 0) {
+            throw new InvalidImageArgumentException(
+                sprintf('Canvas dimensions must be positive, got %d×%d.', $width, $height)
+            );
+        }
+
+        $this->assertWithinPixelLimit($width, $height);
+
+        $this->image  = $this->createCanvas($width, $height, $background);
+        $this->format = Format::PNG;
+        $this->exif   = [];
+        $this->iptc   = [];
+
+        return $this;
+    }
 
     public function fromFile(string $path): static
     {
@@ -120,9 +173,20 @@ final class GDDriver implements DriverInterface
             );
         }
 
-        $data = file_get_contents($path);
+        // Header-only check on the file first: avoids reading a huge file into
+        // memory at all when its announced dimensions already violate the limit.
+        if ($this->maxPixels !== null) {
+            [$info] = $this->captureWarning(static fn () => getimagesize($path));
+            if (is_array($info)) {
+                $this->assertWithinPixelLimit((int) $info[0], (int) $info[1]);
+            }
+        }
+
+        [$data, $warning] = $this->captureWarning(static fn () => file_get_contents($path));
         if ($data === false) {
-            throw new ImageLoadException(sprintf('Failed to read file: "%s".', $path));
+            throw new ImageLoadException(
+                sprintf('Failed to read file: "%s".%s', $path, $warning !== null ? ' ' . $warning : '')
+            );
         }
 
         $this->loadRawData($data);
@@ -131,7 +195,9 @@ final class GDDriver implements DriverInterface
         $this->iptc   = [];
 
         if ($this->format === Format::JPEG && function_exists('exif_read_data')) {
-            $raw = @exif_read_data($path);
+            // A warning here is routine (e.g. no EXIF segment) and never an error:
+            // it is captured only to be discarded, never escalated into a failure.
+            [$raw] = $this->captureWarning(static fn () => exif_read_data($path));
             /** @var array<string, mixed> $safe */
             $safe = is_array($raw) ? $raw : [];
             $this->exif = $safe;
@@ -147,10 +213,16 @@ final class GDDriver implements DriverInterface
             'https' => ['timeout' => self::HTTP_TIMEOUT, 'method' => 'GET'],
         ]);
 
-        $data = @file_get_contents($url, false, $context);
+        [$data, $warning] = $this->captureWarning(
+            static fn () => file_get_contents($url, false, $context)
+        );
         if ($data === false) {
             throw new ImageLoadException(
-                sprintf('Failed to fetch image from URL: "%s".', $url)
+                sprintf(
+                    'Failed to fetch image from URL: "%s".%s',
+                    $url,
+                    $warning !== null ? ' ' . $warning : '',
+                )
             );
         }
 
@@ -177,9 +249,30 @@ final class GDDriver implements DriverInterface
         return $this->fromString($decoded);
     }
 
+    /**
+     * Load an image from a driver-native GdImage instance or a raw binary string.
+     *
+     * **Format note:** when $blob is a {@see GdImage}, PHP provides no API to
+     * recover the original file format from the in-memory pixel buffer.
+     * The driver therefore retains whatever format was last set (default:
+     * {@see Format::JPEG} on a fresh instance).  If you need a specific output
+     * format after loading a raw GdImage, call the relevant conversion method
+     * explicitly (e.g. {@see toPng()}, {@see toWebp()}) before any output call.
+     *
+     * When $blob is a binary string the format is detected automatically from
+     * the data headers, matching the behaviour of {@see fromString()}.
+     *
+     * @param mixed $blob A GdImage instance or a raw binary image string.
+     * @return static
+     * @throws ImageLoadException When $blob is not a GdImage or a valid image string.
+     */
     public function fromBlob(mixed $blob): static
     {
         if ($blob instanceof GdImage) {
+            // Already decoded: only the existing dimensions can be checked, the
+            // memory allocation (if any) already happened in the caller's code.
+            $this->assertWithinPixelLimit(imagesx($blob), imagesy($blob));
+
             $this->image  = $blob;
             $this->exif   = [];
             $this->iptc   = [];
@@ -229,9 +322,14 @@ final class GDDriver implements DriverInterface
     public function save(string $path): static
     {
         $data = $this->toString();
-        if (file_put_contents($path, $data) === false) {
+        [$result, $warning] = $this->captureWarning(static fn () => file_put_contents($path, $data));
+        if ($result === false) {
             throw new ImageSaveException(
-                sprintf('Failed to write image to: "%s".', $path)
+                sprintf(
+                    'Failed to write image to: "%s".%s',
+                    $path,
+                    $warning !== null ? ' ' . $warning : '',
+                )
             );
         }
 
@@ -268,8 +366,11 @@ final class GDDriver implements DriverInterface
         }
 
         $data = $this->toString();
-        if (fwrite($resource, $data) === false) {
-            throw new ImageSaveException('Failed to write image data to the resource.');
+        [$result, $warning] = $this->captureWarning(static fn () => fwrite($resource, $data));
+        if ($result === false) {
+            throw new ImageSaveException(
+                'Failed to write image data to the resource.' . ($warning !== null ? ' ' . $warning : '')
+            );
         }
 
         return $this;
@@ -740,15 +841,23 @@ final class GDDriver implements DriverInterface
         string $content,
         int $x,
         int $y,
-        string $fontPath,
+        ?string $fontPath,
         int $fontSize,
         Color $color,
         float $angle = 0.0,
+        Position $anchor = Position::TOP_LEFT,
     ): static {
         if ($fontSize <= 0) {
             throw new InvalidImageArgumentException(
                 'Font size must be a positive integer.'
             );
+        }
+
+        $src        = $this->requireImage();
+        $colorIndex = $this->allocateColor($src, $color);
+
+        if ($fontPath === null) {
+            return $this->textWithBuiltinFont($src, $content, $x, $y, $fontSize, $colorIndex, $angle, $anchor);
         }
 
         if (!is_file($fontPath) || !is_readable($fontPath)) {
@@ -757,11 +866,41 @@ final class GDDriver implements DriverInterface
             );
         }
 
-        $src        = $this->requireImage();
-        $colorIndex = $this->allocateColor($src, $color);
-
         // GD angle is counter-clockwise; negate for clockwise API
-        $result = imagettftext($src, (float) $fontSize, -$angle, $x, $y, $colorIndex, $fontPath, $content);
+        $gdAngle = -$angle;
+        $box     = imagettfbbox((float) $fontSize, $gdAngle, $fontPath, $content);
+        if ($box === false) {
+            throw new ImageLoadException(
+                'Failed to measure text (FreeType support may not be compiled into GD).'
+            );
+        }
+
+        $corners = [];
+        foreach ($box as $point) {
+            if (!is_int($point)) {
+                throw new ImageLoadException('GD returned an unexpected bounding box format.');
+            }
+
+            $corners[] = $point;
+        }
+
+        $minX = (float) min($corners[0], $corners[2], $corners[4], $corners[6]);
+        $maxX = (float) max($corners[0], $corners[2], $corners[4], $corners[6]);
+        $minY = (float) min($corners[1], $corners[3], $corners[5], $corners[7]);
+        $maxY = (float) max($corners[1], $corners[3], $corners[5], $corners[7]);
+
+        [$originX, $originY] = $anchor->toAnchorOrigin((float) $x, (float) $y, $minX, $minY, $maxX, $maxY);
+
+        $result = imagettftext(
+            $src,
+            (float) $fontSize,
+            $gdAngle,
+            (int) round($originX),
+            (int) round($originY),
+            $colorIndex,
+            $fontPath,
+            $content,
+        );
         if ($result === false) {
             throw new ImageLoadException(
                 'Failed to render text (FreeType support may not be compiled into GD).'
@@ -769,6 +908,102 @@ final class GDDriver implements DriverInterface
         }
 
         return $this;
+    }
+
+    /**
+     * Render $content using one of GD's built-in bitmap fonts (imagestring()).
+     *
+     * $content must first be converted from UTF-8 to ISO-8859-1 (the only
+     * range GD's built-in fonts can render) BEFORE measuring its bounding
+     * box: imagefontwidth() counts bytes, not UTF-8 code points, so measuring
+     * before converting silently mis-centres every non-ASCII string while
+     * still "succeeding".
+     *
+     * @throws InvalidImageArgumentException When $angle is non-zero (built-in
+     *                                        fonts do not support rotation) or
+     *                                        $content contains a character
+     *                                        outside the ISO-8859-1 range.
+     */
+    private function textWithBuiltinFont(
+        GdImage $image,
+        string $content,
+        int $x,
+        int $y,
+        int $fontSize,
+        int $colorIndex,
+        float $angle,
+        Position $anchor,
+    ): static {
+        if ($angle !== 0.0) {
+            throw new InvalidImageArgumentException(
+                'GD built-in fonts do not support rotation; $angle must be 0.0.'
+            );
+        }
+
+        // Encoding conversion MUST happen before measurement (see docblock).
+        $latin1    = $this->convertToBuiltinFontEncoding($content);
+        $fontIndex = $this->nearestBuiltinFont($fontSize);
+
+        $boxWidth  = (float) (imagefontwidth($fontIndex) * strlen($latin1));
+        $boxHeight = (float) imagefontheight($fontIndex);
+
+        [$originX, $originY] = $anchor->toAnchorOrigin((float) $x, (float) $y, 0.0, 0.0, $boxWidth, $boxHeight);
+
+        imagestring($image, $fontIndex, (int) round($originX), (int) round($originY), $latin1, $colorIndex);
+
+        return $this;
+    }
+
+    /**
+     * Convert UTF-8 text to ISO-8859-1 for GD's built-in bitmap fonts.
+     *
+     * Never substitutes an unrepresentable character (no '?', no dropped
+     * character): the caller must know upfront whether its string fits.
+     *
+     * @throws InvalidImageArgumentException When $content is not valid UTF-8, or
+     *                                        contains a character above U+00FF.
+     */
+    private function convertToBuiltinFontEncoding(string $content): string
+    {
+        if (!mb_check_encoding($content, 'UTF-8')) {
+            throw new InvalidImageArgumentException('Text content must be valid UTF-8.');
+        }
+
+        $converted = '';
+        foreach (mb_str_split($content, 1, 'UTF-8') as $char) {
+            $codepoint = mb_ord($char, 'UTF-8');
+            if ($codepoint < 0 || $codepoint > self::LATIN1_MAX_CODEPOINT) {
+                throw new InvalidImageArgumentException(sprintf(
+                    'Character "%s" (U+%04X) cannot be rendered by the GD built-in font: '
+                    . 'only the ISO-8859-1 range (code point <= U+00FF) is supported.',
+                    $char,
+                    $codepoint,
+                ));
+            }
+
+            $converted .= chr($codepoint);
+        }
+
+        return $converted;
+    }
+
+    /**
+     * Pick the GD built-in font index (1-5) whose height is nearest to $fontSize.
+     */
+    private function nearestBuiltinFont(int $fontSize): int
+    {
+        $best      = self::BUILTIN_FONT_MIN;
+        $bestDelta = PHP_INT_MAX;
+
+        for ($index = self::BUILTIN_FONT_MIN; $index <= self::BUILTIN_FONT_MAX; $index++) {
+            $delta = abs(imagefontheight($index) - $fontSize);
+            if ($delta < $bestDelta) {
+                $bestDelta = $delta;
+                $best      = $index;
+            }
+        }
+
+        return $best;
     }
 
     public function rect(
@@ -1108,13 +1343,21 @@ final class GDDriver implements DriverInterface
     /**
      * Decode raw binary data and store the resulting GdImage in $this->image.
      *
+     * Enforces the configured pixel limit (if any) by inspecting the header
+     * via {@see getimagesizefromstring()} before decoding.
+     *
      * @throws ImageLoadException When GD cannot decode the data.
+     * @throws ImageLimitExceededException When a pixel limit is configured and exceeded.
      */
     private function loadRawData(string $data): void
     {
-        $image = @imagecreatefromstring($data);
+        $this->assertPixelLimitFromHeader($data);
+
+        [$image, $warning] = $this->captureWarning(static fn () => imagecreatefromstring($data));
         if ($image === false) {
-            throw new ImageLoadException('GD could not decode the provided image data.');
+            throw new ImageLoadException(
+                'GD could not decode the provided image data.' . ($warning !== null ? ' ' . $warning : '')
+            );
         }
 
         imagealphablending($image, true);
@@ -1130,15 +1373,56 @@ final class GDDriver implements DriverInterface
      */
     private function buildGdImage(string $data): GdImage
     {
-        $image = @imagecreatefromstring($data);
+        [$image, $warning] = $this->captureWarning(static fn () => imagecreatefromstring($data));
         if ($image === false) {
-            throw new ImageLoadException('GD could not decode the provided image data.');
+            throw new ImageLoadException(
+                'GD could not decode the provided image data.' . ($warning !== null ? ' ' . $warning : '')
+            );
         }
 
         imagealphablending($image, true);
         imagesavealpha($image, true);
 
         return $image;
+    }
+
+    /**
+     * Throw when the configured pixel limit is exceeded.
+     *
+     * No-op when no limit is configured (default).
+     *
+     * @throws ImageLimitExceededException When the limit is configured and exceeded.
+     */
+    private function assertWithinPixelLimit(int $width, int $height): void
+    {
+        if ($this->maxPixels === null) {
+            return;
+        }
+
+        $pixelCount = $width * $height;
+        if ($pixelCount > $this->maxPixels) {
+            throw new ImageLimitExceededException($pixelCount, $this->maxPixels);
+        }
+    }
+
+    /**
+     * Enforce the pixel limit from the header of encoded image data, without decoding it.
+     *
+     * Silently returns when the header cannot be parsed: the subsequent decode
+     * call is responsible for surfacing that failure with a clear message.
+     *
+     * @throws ImageLimitExceededException When a pixel limit is configured and exceeded.
+     */
+    private function assertPixelLimitFromHeader(string $data): void
+    {
+        if ($this->maxPixels === null) {
+            return;
+        }
+
+        [$info] = $this->captureWarning(static fn () => getimagesizefromstring($data));
+        if (is_array($info)) {
+            $this->assertWithinPixelLimit((int) $info[0], (int) $info[1]);
+        }
     }
 
     /**
@@ -1211,9 +1495,12 @@ final class GDDriver implements DriverInterface
      */
     private function detectFormat(string $data): Format
     {
-        $info = @getimagesizefromstring($data);
+        [$info, $warning] = $this->captureWarning(static fn () => getimagesizefromstring($data));
         if ($info === false) {
-            throw new ImageLoadException('Could not determine the image format from the provided data.');
+            throw new ImageLoadException(
+                'Could not determine the image format from the provided data.'
+                . ($warning !== null ? ' ' . $warning : '')
+            );
         }
 
         $mime = $info['mime'];

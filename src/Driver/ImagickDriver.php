@@ -9,6 +9,7 @@ use G\Image\Enum\Fit;
 use G\Image\Enum\Flip;
 use G\Image\Enum\Format;
 use G\Image\Enum\Position;
+use G\Image\Exception\ImageLimitExceededException;
 use G\Image\Exception\ImageLoadException;
 use G\Image\Exception\ImageSaveException;
 use G\Image\Exception\InvalidImageArgumentException;
@@ -37,8 +38,10 @@ use Psr\Http\Message\StreamInterface;
  *
  * EXIF: readable on load for JPEG; writing throws {@see UnsupportedOperationException}.
  */
-final class ImagickDriver implements DriverInterface
+final class ImagickDriver implements DriverInterface, DriverAvailabilityInterface
 {
+    use CapturesNativeWarnings;
+
     // ─── Default encoding quality per format ───────────────────────────────────
     private const DEFAULT_QUALITY_JPEG = 85;
     private const DEFAULT_QUALITY_WEBP = 80;
@@ -84,6 +87,7 @@ final class ImagickDriver implements DriverInterface
 
     // ─── Operations supported by this driver ──────────────────────────────────
     private const SUPPORTED_OPERATIONS = [
+        'fromBlank',
         'resize', 'scale',
         'crop', 'trim',
         'rotate', 'flip',
@@ -102,6 +106,8 @@ final class ImagickDriver implements DriverInterface
     private Format $format = Format::JPEG;
 
     private ?int $quality = null;
+
+    private ?int $maxPixels = null;
 
     /** @var array<string, mixed> */
     private array $exif = [];
@@ -123,9 +129,56 @@ final class ImagickDriver implements DriverInterface
         }
     }
 
+    public static function isAvailable(): bool
+    {
+        return extension_loaded('imagick');
+    }
+
+    // =========================================================================
+    // PixelLimitInterface
+    // =========================================================================
+
+    public function limitPixels(?int $maxPixels): static
+    {
+        if ($maxPixels !== null && $maxPixels <= 0) {
+            throw new InvalidImageArgumentException(
+                'Pixel limit must be a positive integer, or null to disable it.'
+            );
+        }
+
+        $this->maxPixels = $maxPixels;
+
+        return $this;
+    }
+
     // =========================================================================
     // InputInterface
     // =========================================================================
+
+    public function fromBlank(int $width, int $height, ?Color $background = null): static
+    {
+        if ($width <= 0 || $height <= 0) {
+            throw new InvalidImageArgumentException(
+                sprintf('Canvas dimensions must be positive, got %d×%d.', $width, $height)
+            );
+        }
+
+        $this->assertWithinPixelLimit($width, $height);
+
+        try {
+            $imagick = new Imagick();
+            $imagick->newImage($width, $height, $this->toImagickPixel($background ?? Color::transparent()), 'png');
+        } catch (ImagickException $e) {
+            throw new ImageLoadException('Imagick failed to allocate a blank canvas.', previous: $e);
+        }
+
+        $this->imagick = $imagick;
+        $this->format  = Format::PNG;
+        $this->exif    = [];
+        $this->iptc    = [];
+
+        return $this;
+    }
 
     public function fromFile(string $path): static
     {
@@ -135,8 +188,17 @@ final class ImagickDriver implements DriverInterface
             );
         }
 
+        if ($this->maxPixels !== null) {
+            [$info] = $this->captureWarning(static fn () => getimagesize($path));
+            if (is_array($info)) {
+                $this->assertWithinPixelLimit((int) $info[0], (int) $info[1]);
+            }
+        }
+
         try {
             $imagick = new Imagick();
+            $imagick->pingImage($path);
+            $this->assertWithinPixelLimit($imagick->getImageWidth(), $imagick->getImageHeight());
             $imagick->readImage($path);
             $imagick->setIteratorIndex(0);
         } catch (ImagickException $e) {
@@ -161,10 +223,16 @@ final class ImagickDriver implements DriverInterface
             'https' => ['timeout' => self::HTTP_TIMEOUT, 'method' => 'GET'],
         ]);
 
-        $data = @file_get_contents($url, false, $context);
+        [$data, $warning] = $this->captureWarning(
+            static fn () => file_get_contents($url, false, $context)
+        );
         if ($data === false) {
             throw new ImageLoadException(
-                sprintf('Failed to fetch image from URL: "%s".', $url)
+                sprintf(
+                    'Failed to fetch image from URL: "%s".%s',
+                    $url,
+                    $warning !== null ? ' ' . $warning : '',
+                )
             );
         }
 
@@ -173,6 +241,8 @@ final class ImagickDriver implements DriverInterface
 
     public function fromString(string $data): static
     {
+        $this->assertPixelLimitFromHeader($data);
+
         try {
             $imagick = new Imagick();
             $imagick->readImageBlob($data);
@@ -205,6 +275,10 @@ final class ImagickDriver implements DriverInterface
     public function fromBlob(mixed $blob): static
     {
         if ($blob instanceof Imagick) {
+            // Already decoded: only the existing dimensions can be checked, the
+            // memory allocation (if any) already happened in the caller's code.
+            $this->assertWithinPixelLimit($blob->getImageWidth(), $blob->getImageHeight());
+
             $this->imagick = clone $blob;
             $this->imagick->setIteratorIndex(0);
             $this->format = $this->detectFormatFromImagick();
@@ -256,9 +330,14 @@ final class ImagickDriver implements DriverInterface
     public function save(string $path): static
     {
         $data = $this->toString();
-        if (file_put_contents($path, $data) === false) {
+        [$result, $warning] = $this->captureWarning(static fn () => file_put_contents($path, $data));
+        if ($result === false) {
             throw new ImageSaveException(
-                sprintf('Failed to write image to: "%s".', $path)
+                sprintf(
+                    'Failed to write image to: "%s".%s',
+                    $path,
+                    $warning !== null ? ' ' . $warning : '',
+                )
             );
         }
 
@@ -295,8 +374,11 @@ final class ImagickDriver implements DriverInterface
         }
 
         $data = $this->toString();
-        if (fwrite($resource, $data) === false) {
-            throw new ImageSaveException('Failed to write image data to the resource.');
+        [$result, $warning] = $this->captureWarning(static fn () => fwrite($resource, $data));
+        if ($result === false) {
+            throw new ImageSaveException(
+                'Failed to write image data to the resource.' . ($warning !== null ? ' ' . $warning : '')
+            );
         }
 
         return $this;
@@ -814,14 +896,21 @@ final class ImagickDriver implements DriverInterface
         string $content,
         int $x,
         int $y,
-        string $fontPath,
+        ?string $fontPath,
         int $fontSize,
         Color $color,
         float $angle = 0.0,
+        Position $anchor = Position::TOP_LEFT,
     ): static {
         if ($fontSize <= 0) {
             throw new InvalidImageArgumentException(
                 'Font size must be a positive integer.'
+            );
+        }
+
+        if ($fontPath === null) {
+            throw new UnsupportedOperationException(
+                'ImagickDriver does not support a built-in font; a TrueType/OpenType $fontPath is required.'
             );
         }
 
@@ -838,8 +927,19 @@ final class ImagickDriver implements DriverInterface
             $draw->setFillColor($this->toImagickPixel($color));
             $draw->setTextAntialias(true);
 
+            $image   = $this->requireImage();
+            $metrics = $image->queryFontMetrics($draw, $content);
+            $width   = (float) $metrics['textWidth'];
+            $height  = (float) $metrics['textHeight'];
+            $ascender = (float) $metrics['ascender'];
+
+            // queryFontMetrics gives a top-left-origin box; annotateImage still
+            // expects a baseline Y, so the ascender re-derives it after anchoring.
+            [$originX, $topY] = $anchor->toAnchorOrigin((float) $x, (float) $y, 0.0, 0.0, $width, $height);
+            $baselineY = $topY + $ascender;
+
             // annotateImage angle: clockwise degrees, matching our API
-            $this->requireImage()->annotateImage($draw, (float) $x, (float) $y, $angle, $content);
+            $image->annotateImage($draw, $originX, $baselineY, $angle, $content);
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to render text.', previous: $e);
         }
@@ -1279,6 +1379,60 @@ final class ImagickDriver implements DriverInterface
         }
 
         return $this->imagick;
+    }
+
+    /**
+     * Throw when the configured pixel limit is exceeded.
+     *
+     * No-op when no limit is configured (default).
+     *
+     * @throws ImageLimitExceededException When the limit is configured and exceeded.
+     */
+    private function assertWithinPixelLimit(int $width, int $height): void
+    {
+        if ($this->maxPixels === null) {
+            return;
+        }
+
+        $pixelCount = $width * $height;
+        if ($pixelCount > $this->maxPixels) {
+            throw new ImageLimitExceededException($pixelCount, $this->maxPixels);
+        }
+    }
+
+    /**
+     * Enforce the pixel limit from the header of encoded image data, without decoding it.
+     *
+     * The dimensions are read by PHP itself first (getimagesizefromstring() only
+     * parses the header and knows the common formats), then by
+     * {@see Imagick::pingImageBlob()} for the others: depending on its version
+     * and security policy, ImageMagick may refuse to ping an oversized or
+     * truncated image, which must not hide the limit violation.
+     * Silently returns when the header cannot be parsed: the subsequent
+     * decode call is responsible for surfacing that failure with a clear message.
+     *
+     * @throws ImageLimitExceededException When a pixel limit is configured and exceeded.
+     */
+    private function assertPixelLimitFromHeader(string $data): void
+    {
+        if ($this->maxPixels === null) {
+            return;
+        }
+
+        [$info] = $this->captureWarning(static fn () => getimagesizefromstring($data));
+        if (is_array($info)) {
+            $this->assertWithinPixelLimit((int) $info[0], (int) $info[1]);
+
+            return;
+        }
+
+        try {
+            $probe = new Imagick();
+            $probe->pingImageBlob($data);
+            $this->assertWithinPixelLimit($probe->getImageWidth(), $probe->getImageHeight());
+        } catch (ImagickException) {
+            // Header could not be parsed; let the subsequent decode call report it.
+        }
     }
 
     /**
