@@ -41,12 +41,21 @@ use Psr\Http\Message\StreamInterface;
 final class ImagickDriver implements DriverInterface, DriverAvailabilityInterface
 {
     use CapturesNativeWarnings;
+    use ValidatesInput;
 
     // ─── Default encoding quality per format ───────────────────────────────────
     private const DEFAULT_QUALITY_JPEG = 85;
     private const DEFAULT_QUALITY_WEBP = 80;
     private const DEFAULT_QUALITY_AVIF = 75;
     private const DEFAULT_QUALITY_PNG  = 6;
+
+    // ─── PNG "quality" for ImageMagick: tens = zlib level, units = filter ─────
+    private const PNG_LEVEL_FACTOR    = 10;
+    private const PNG_ADAPTIVE_FILTER = 5;
+
+    // ─── GIF delay ticks per second when the image declares none ──────────────
+    private const DEFAULT_TICKS_PER_SECOND = 100;
+    private const MILLISECONDS_PER_SECOND  = 1000;
 
     // ─── Filter level range ────────────────────────────────────────────────────
     private const LEVEL_MIN = -100;
@@ -72,6 +81,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
     // ─── Scale / dimension helpers ─────────────────────────────────────────────
     private const PERCENTAGE_DIVISOR = 100;
     private const CENTER_DIVISOR     =   2;
+    private const NO_SCALE           = 1.0;
 
     // ─── Color channel max / geometry helpers ──────────────────────────────────
     private const CHANNEL_MAX       = 255;
@@ -195,29 +205,22 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             }
         }
 
-        try {
-            $imagick = new Imagick();
-            $imagick->pingImage($path);
-            $this->assertWithinPixelLimit($imagick->getImageWidth(), $imagick->getImageHeight());
-            $imagick->readImage($path);
-            $imagick->setIteratorIndex(0);
-        } catch (ImagickException $e) {
+        // Read by PHP and decoded from memory: a path given to ImageMagick
+        // is itself parsed ("format:" prefixes, "[0]" frame selectors...).
+        [$data, $warning] = $this->captureWarning(static fn () => file_get_contents($path));
+        if ($data === false) {
             throw new ImageLoadException(
-                sprintf('Imagick could not read file: "%s".', $path),
-                previous: $e,
+                sprintf('Failed to read file: "%s".%s', $path, $warning !== null ? ' ' . $warning : '')
             );
         }
 
-        $this->imagick = $imagick;
-        $this->format  = $this->detectFormatFromImagick();
-        $this->exif    = $this->readExif();
-        $this->iptc    = [];
-
-        return $this;
+        return $this->fromString($data);
     }
 
     public function fromUrl(string $url): static
     {
+        $this->assertHttpUrl($url);
+
         $context = stream_context_create([
             'http'  => ['timeout' => self::HTTP_TIMEOUT, 'method' => 'GET'],
             'https' => ['timeout' => self::HTTP_TIMEOUT, 'method' => 'GET'],
@@ -241,6 +244,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
     public function fromString(string $data): static
     {
+        $this->assertRasterSignature($data);
         $this->assertPixelLimitFromHeader($data);
 
         try {
@@ -257,7 +261,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         $this->imagick = $imagick;
         $this->format  = $this->detectFormatFromImagick();
         $this->exif    = $this->readExif();
-        $this->iptc    = [];
+        $this->iptc    = $this->readIptc();
 
         return $this;
     }
@@ -427,10 +431,12 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
         if ($width === null) {
             /** @var int<1, max> $height */
-            $width = (int) round($srcW * $height / $srcH);
+            $width = max(1, (int) round($srcW * $height / $srcH));
         } elseif ($height === null) {
-            $height = (int) round($srcH * $width / $srcW);
+            $height = max(1, (int) round($srcH * $width / $srcW));
         }
+
+        $this->assertWithinPixelLimit($width, $height);
 
         if ($fit === Fit::FILL) {
             $this->resizeFill($width, $height, $upscale);
@@ -460,6 +466,8 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
                 'Resulting dimensions after scale are too small (less than 1 pixel).'
             );
         }
+
+        $this->assertWithinPixelLimit($newW, $newH);
 
         try {
             $image->resizeImage($newW, $newH, Imagick::FILTER_LANCZOS, self::IMAGICK_FILTER_BLUR);
@@ -721,6 +729,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
     public function toJpeg(?int $quality = null): static
     {
+        $this->assertLossyQuality($quality, 'JPEG');
         $this->format  = Format::JPEG;
         $this->quality = $quality;
 
@@ -729,6 +738,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
     public function toPng(?int $quality = null): static
     {
+        $this->assertPngCompression($quality);
         $this->format  = Format::PNG;
         $this->quality = $quality;
 
@@ -743,6 +753,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
+        $this->assertLossyQuality($quality, 'WebP');
         $this->format  = Format::WEBP;
         $this->quality = $quality;
 
@@ -757,6 +768,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
+        $this->assertLossyQuality($quality, 'AVIF');
         $this->format  = Format::AVIF;
         $this->quality = $quality;
 
@@ -779,6 +791,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
+        $this->assertBmpCompression($quality);
         $this->format  = Format::BMP;
         $this->quality = $quality;
 
@@ -807,6 +820,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
+        $this->assertLossyQuality($quality, 'HEIC');
         $this->format  = Format::HEIC;
         $this->quality = $quality;
 
@@ -852,8 +866,10 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             $wmImagick = clone $watermark->imagick;
         } elseif ($watermark instanceof OutputInterface) {
             try {
+                $wmData = $watermark->toString();
+                $this->assertRasterSignature($wmData);
                 $wmImagick = new Imagick();
-                $wmImagick->readImageBlob($watermark->toString());
+                $wmImagick->readImageBlob($wmData);
             } catch (ImagickException $e) {
                 throw new ImageLoadException('Failed to load watermark image.', previous: $e);
             }
@@ -1261,9 +1277,13 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         $imagick = $this->imagick;
         $imagick->setIteratorIndex($index);
         $delay = $imagick->getImageDelay();
+        $ticks = $imagick->getImageTicksPerSecond();
         $imagick->setIteratorIndex(0);
 
-        return $delay;
+        // ImageMagick counts in ticks (1/100 s for GIF); the API in milliseconds.
+        $ticks = $ticks > 0 ? $ticks : self::DEFAULT_TICKS_PER_SECOND;
+
+        return intdiv($delay * self::MILLISECONDS_PER_SECOND, $ticks);
     }
 
     public function setFrameDelay(int $index, int $delay): static
@@ -1275,7 +1295,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
     public function getLoopCount(): int
     {
-        return 0;
+        return $this->imagick !== null ? max(0, $this->imagick->getImageIterations()) : 0;
     }
 
     public function setLoopCount(int $count): static
@@ -1492,7 +1512,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         try {
             $clone = clone $image;
             $clone->setImageFormat($this->formatToImagickString($format));
-            $clone->setImageCompressionQuality($quality ?? $this->defaultQuality($format));
+            $clone->setImageCompressionQuality($this->imagickQuality($format, $quality));
 
             return $clone->getImageBlob();
         } catch (ImagickException $e) {
@@ -1523,6 +1543,51 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
                 sprintf('Format "%s" is not supported by the Imagick driver.', $format->value)
             ),
         };
+    }
+
+    /**
+     * The value given to setImageCompressionQuality(). For PNG, ImageMagick
+     * reads it as two digits: the zlib level (tens) and the row filter
+     * (units); the API's 0-9 compression level becomes "level, adaptive
+     * filter" (6 → 65), where a bare 6 would mean "no compression".
+     */
+    private function imagickQuality(Format $format, ?int $quality): int
+    {
+        $value = $quality ?? $this->defaultQuality($format);
+
+        return $format === Format::PNG
+            ? $value * self::PNG_LEVEL_FACTOR + self::PNG_ADAPTIVE_FILTER
+            : $value;
+    }
+
+    /**
+     * Read the IPTC profile of the loaded image, keyed like iptcparse().
+     *
+     * @return array<string, mixed>
+     */
+    private function readIptc(): array
+    {
+        if ($this->imagick === null) {
+            return [];
+        }
+
+        try {
+            $profiles = $this->imagick->getImageProfiles('iptc');
+        } catch (ImagickException) {
+            return [];
+        }
+
+        $raw = $profiles['iptc'] ?? null;
+        if (!is_string($raw) || $raw === '') {
+            return [];
+        }
+
+        [$iptc] = $this->captureWarning(static fn () => iptcparse($raw));
+
+        /** @var array<string, mixed> $parsed */
+        $parsed = is_array($iptc) ? $iptc : [];
+
+        return $parsed;
     }
 
     /**
@@ -1584,8 +1649,29 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         $srcH   = $image->getImageHeight();
         $ratio  = max($dstW / $srcW, $dstH / $srcH);
 
-        if (!$upscale) {
-            $ratio = min($ratio, 1.0);
+        // Without upscaling a source smaller than the target is never
+        // stretched: the canvas keeps the requested size and receives the
+        // source as is (cropped where it is larger), placed at $position.
+        if (!$upscale && $ratio > self::NO_SCALE) {
+            $cropW = min($dstW, $srcW);
+            $cropH = min($dstH, $srcH);
+            [$fromX, $fromY] = $position->toOffset($srcW, $srcH, $cropW, $cropH);
+            [$toX, $toY]     = $position->toOffset($dstW, $dstH, $cropW, $cropH);
+
+            try {
+                $image->cropImage($cropW, $cropH, $fromX, $fromY);
+                $image->setImagePage(0, 0, 0, 0);
+
+                $canvas = new Imagick();
+                $canvas->newImage($dstW, $dstH, $this->toImagickPixel(Color::transparent()), 'png');
+                $canvas->compositeImage($image, Imagick::COMPOSITE_OVER, $toX, $toY);
+
+                $this->imagick = $canvas;
+            } catch (ImagickException $e) {
+                throw new ImageLoadException('Imagick failed to resize (cover).', previous: $e);
+            }
+
+            return;
         }
 
         $scaledW = max(1, (int) round($srcW * $ratio));
