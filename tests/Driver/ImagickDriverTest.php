@@ -1313,4 +1313,71 @@ final class ImagickDriverTest extends TestCase
         $this->expectException(ImageSaveException::class);
         $this->loaded()->toPng()->save('/nonexistent/directory/xyz/output.png');
     }
+    // =========================================================================
+    // Review fixes
+    // =========================================================================
+
+    public function testRefusesDataThatIsNotARasterImage(): void
+    {
+        // An SVG would reach ImageMagick's MSVG/MVG coders (local file reads).
+        $svg = '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
+
+        $this->expectException(ImageLoadException::class);
+        $this->expectExceptionMessage('not a supported raster image');
+
+        (new ImagickDriver())->fromString($svg);
+    }
+
+    public function testFromFileAppliesTheSameSignatureCheck(): void
+    {
+        $path = tempnam(sys_get_temp_dir(), 'imagick_svg_');
+        self::assertIsString($path);
+        file_put_contents($path, '<svg xmlns="http://www.w3.org/2000/svg"/>');
+
+        try {
+            $this->expectException(ImageLoadException::class);
+            (new ImagickDriver())->fromFile($path);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testFromUrlRefusesAnythingButHttp(): void
+    {
+        $this->expectException(ImageLoadException::class);
+
+        (new ImagickDriver())->fromUrl('file:///etc/passwd');
+    }
+
+    public function testQualityOutsideTheDocumentedRangeIsRefused(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+
+        $this->loaded()->toPng(85);
+    }
+
+    public function testResizeIsBoundByThePixelLimit(): void
+    {
+        $driver = (new ImagickDriver())->limitPixels(10_000)->fromString($this->makePng(20, 20));
+
+        $this->expectException(ImageLimitExceededException::class);
+
+        $driver->resize(1000, 1000, Fit::FILL);
+    }
+
+    public function testCoverWithoutUpscaleKeepsTheTargetCanvas(): void
+    {
+        $driver = $this->loaded(20, 20)->resize(100, 100, Fit::COVER, upscale: false);
+
+        self::assertSame(100, $driver->getWidth());
+        self::assertSame(100, $driver->getHeight());
+    }
+
+    public function testPngOutputIsCompressedByDefault(): void
+    {
+        // 200x200 RGBA uncompressed is ~160 kB; a uniform image compresses to almost nothing.
+        $png = (new ImagickDriver())->fromBlank(200, 200, Color::fromRgba(10, 20, 30, 1.0))->toPng()->toString();
+
+        self::assertLessThan(10_000, strlen($png));
+    }
 }

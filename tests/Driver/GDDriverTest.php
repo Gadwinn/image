@@ -1476,4 +1476,106 @@ final class GDDriverTest extends TestCase
             @unlink($path);
         }
     }
+
+    // =========================================================================
+    // Review fixes
+    // =========================================================================
+
+    public function testFromUrlRefusesAnythingButHttp(): void
+    {
+        $this->expectException(ImageLoadException::class);
+        $this->expectExceptionMessage('Only http and https');
+
+        (new GDDriver())->fromUrl('file:///etc/passwd');
+    }
+
+    public function testQualityOutsideTheDocumentedRangeIsRefused(): void
+    {
+        foreach ([fn () => $this->loaded()->toPng(85), fn () => $this->loaded()->toJpeg(0)] as $call) {
+            try {
+                $call();
+                self::fail('Expected an InvalidImageArgumentException.');
+            } catch (InvalidImageArgumentException) {
+                self::assertSame(0, ob_get_level() - $this->bufferLevel, 'no output buffer left open');
+            }
+        }
+    }
+
+    public function testResizeIsBoundByThePixelLimit(): void
+    {
+        $driver = (new GDDriver())->limitPixels(10_000)->fromString($this->makePng(20, 20));
+
+        $this->expectException(ImageLimitExceededException::class);
+
+        $driver->resize(1000, 1000, Fit::FILL);
+    }
+
+    public function testCoverWithoutUpscaleKeepsTheTargetCanvasWithoutStretching(): void
+    {
+        $driver = (new GDDriver())->fromBlank(20, 20, Color::fromRgba(255, 0, 0, 1.0))
+            ->resize(100, 100, Fit::COVER, upscale: false);
+
+        $image = $driver->toBlob();
+        self::assertInstanceOf(GdImage::class, $image);
+        self::assertSame(100, imagesx($image));
+        // Source pasted unscaled in the middle, transparent around it.
+        self::assertSame(['red' => 255, 'green' => 0, 'blue' => 0, 'alpha' => 0], imagecolorsforindex($image, imagecolorat($image, 50, 50)));
+        self::assertSame(127, imagecolorsforindex($image, imagecolorat($image, 5, 5))['alpha']);
+    }
+
+    public function testWatermarkKeepsItsTransparency(): void
+    {
+        $base = (new GDDriver())->fromBlank(10, 10, Color::fromRgba(255, 255, 255, 1.0));
+        $mark = (new GDDriver())->fromBlank(10, 10); // fully transparent
+
+        foreach ([100, 50] as $opacity) {
+            $base->watermark($mark, Position::TOP_LEFT, $opacity);
+            $image = $base->toBlob();
+            self::assertInstanceOf(GdImage::class, $image);
+            $pixel = imagecolorsforindex($image, imagecolorat($image, 5, 5));
+            self::assertSame([255, 255, 255], [$pixel['red'], $pixel['green'], $pixel['blue']], "opacity $opacity");
+        }
+    }
+
+    public function testAPaletteImageIsLoadedInTrueColour(): void
+    {
+        $palette = imagecreate(10, 10);
+        imagecolorallocate($palette, 0, 0, 255);
+        ob_start();
+        imagegif($palette);
+        $gif = (string) ob_get_clean();
+
+        $image = (new GDDriver())->fromString($gif)->toBlob();
+
+        self::assertInstanceOf(GdImage::class, $image);
+        self::assertTrue(imageistruecolor($image));
+    }
+
+    public function testReadsTheIptcBlockOfAJpeg(): void
+    {
+        $iptc = "\x1C\x02\x05\x00\x05Title"; // record 2, dataset 5 (object name)
+        $jpeg = iptcembed($iptc, $this->writeTempJpeg());
+        self::assertIsString($jpeg);
+
+        $driver = (new GDDriver())->fromString($jpeg);
+
+        self::assertSame(['Title'], $driver->getIptc()['2#005'] ?? null);
+    }
+
+    private int $bufferLevel = 0;
+
+    protected function setUp(): void
+    {
+        $this->bufferLevel = ob_get_level();
+    }
+
+    private function writeTempJpeg(): string
+    {
+        $path = tempnam(sys_get_temp_dir(), 'gd_iptc_');
+        self::assertIsString($path);
+        imagejpeg(imagecreatetruecolor(4, 4), $path);
+        register_shutdown_function(static fn () => @unlink($path));
+
+        return $path;
+    }
 }

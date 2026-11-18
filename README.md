@@ -106,7 +106,7 @@ $driver->fromBlank(400, 300, Color::fromHex('#1a1a2e'));
 // From a filesystem path
 $driver->fromFile('/path/to/image.jpg');
 
-// From a URL
+// From a URL (http and https only: file://, php://... are refused)
 $driver->fromUrl('https://example.com/photo.jpg');
 
 // From a raw binary string
@@ -156,6 +156,19 @@ same header check applies there too. The only case it cannot cover is
 the memory is already allocated by the caller at that point; the limit is
 still enforced against the object's existing dimensions, it just can't
 prevent an allocation that already happened.
+
+The limit also applies to the size an operation produces (`resize()`,
+`scale()`), so a target taken from a request parameter cannot exhaust memory.
+
+### Untrusted input with ImagickDriver
+
+ImageMagick chooses its decoder from the content of the data, and some of its
+decoders (SVG, MVG, MSL, `text:`...) can read local files or fetch URLs.
+`ImagickDriver` therefore only accepts data starting with the signature of a
+raster format (JPEG, PNG, GIF, WebP, BMP, TIFF, AVIF, HEIC) and refuses
+anything else with an `ImageLoadException`, before ImageMagick sees it.
+Restricting the coders in ImageMagick's `policy.xml` remains a good practice
+on a server that processes uploads.
 
 ---
 
@@ -412,8 +425,6 @@ $driver->stripMetadata(); // removes EXIF, IPTC, XMP, ICC profiles
 
 ## Animation (ImagickDriver)
 
-`GDDriver` throws `UnsupportedOperationException` for all mutation methods below.
-
 ```php
 use G\Image\Driver\ImagickDriver;
 use G\Image\Factory\ImageFactory;
@@ -426,13 +437,14 @@ $frames     = $anim->getFrames();                 // list<mixed> — Imagick obj
 $frame      = $anim->getFrame(0);                 // mixed — frame at index 0
 
 $delay      = $anim->getFrameDelay(0);            // int — milliseconds
-$anim->setFrameDelay(index: 0, delay: 100);       // set frame 0 to 100 ms
-
-$loops = $anim->getLoopCount();                   // int (0 = infinite)
-$anim->setLoopCount(0);                           // loop forever
-
-// Read only on GDDriver (getFrameCount always returns 1)
+$loops      = $anim->getLoopCount();              // int (0 = infinite)
 ```
+
+Animation support is **read-only** in this version: `addFrame()`,
+`removeFrame()`, `setFrameDelay()` and `setLoopCount()` throw
+`UnsupportedOperationException` on both drivers, and operations and output
+work on the first frame only (an animated GIF is saved as a still image).
+`GDDriver` always reports a single frame.
 
 ---
 

@@ -35,6 +35,7 @@ use Psr\Http\Message\StreamInterface;
 final class GDDriver implements DriverInterface, DriverAvailabilityInterface
 {
     use CapturesNativeWarnings;
+    use ValidatesInput;
 
     // ─── GD alpha (0 = opaque, 127 = transparent) ─────────────────────────────
     private const GD_ALPHA_TRANSPARENT = 127;
@@ -62,6 +63,8 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
     // ─── Scale / dimension helpers ─────────────────────────────────────────────
     private const PERCENTAGE_DIVISOR = 100;
     private const CENTER_DIVISOR     =   2;
+    private const NO_SCALE           = 1.0;
+    private const MIN_DIMENSION      =   1;
 
     // ─── Color channel max ─────────────────────────────────────────────────────
     private const CHANNEL_MAX  = 255;
@@ -192,7 +195,7 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
         $this->loadRawData($data);
         $this->format = $this->detectFormat($data);
         $this->exif   = [];
-        $this->iptc   = [];
+        $this->iptc   = $this->readIptc($data);
 
         if ($this->format === Format::JPEG && function_exists('exif_read_data')) {
             // A warning here is routine (e.g. no EXIF segment) and never an error:
@@ -208,6 +211,8 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
 
     public function fromUrl(string $url): static
     {
+        $this->assertHttpUrl($url);
+
         $context = stream_context_create([
             'http'  => ['timeout' => self::HTTP_TIMEOUT, 'method' => 'GET'],
             'https' => ['timeout' => self::HTTP_TIMEOUT, 'method' => 'GET'],
@@ -234,7 +239,7 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
         $this->loadRawData($data);
         $this->format = $this->detectFormat($data);
         $this->exif   = [];
-        $this->iptc   = [];
+        $this->iptc   = $this->readIptc($data);
 
         return $this;
     }
@@ -418,9 +423,9 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
         $srcH = imagesy($src);
 
         if ($width === null) {
-            $width = (int) round($srcW * $height / $srcH);
+            $width = max(self::MIN_DIMENSION, (int) round($srcW * $height / $srcH));
         } elseif ($height === null) {
-            $height = (int) round($srcH * $width / $srcW);
+            $height = max(self::MIN_DIMENSION, (int) round($srcH * $width / $srcW));
         }
 
         $this->image = match ($fit) {
@@ -706,6 +711,7 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
 
     public function toJpeg(?int $quality = null): static
     {
+        $this->assertLossyQuality($quality, 'JPEG');
         $this->format  = Format::JPEG;
         $this->quality = $quality;
 
@@ -714,6 +720,7 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
 
     public function toPng(?int $quality = null): static
     {
+        $this->assertPngCompression($quality);
         $this->format  = Format::PNG;
         $this->quality = $quality;
 
@@ -728,6 +735,7 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
             );
         }
 
+        $this->assertLossyQuality($quality, 'WebP');
         $this->format  = Format::WEBP;
         $this->quality = $quality;
 
@@ -742,6 +750,7 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
             );
         }
 
+        $this->assertLossyQuality($quality, 'AVIF');
         $this->format  = Format::AVIF;
         $this->quality = $quality;
 
@@ -764,6 +773,7 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
             );
         }
 
+        $this->assertBmpCompression($quality);
         $this->format  = Format::BMP;
         $this->quality = $quality;
 
@@ -832,9 +842,33 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
 
         [$x, $y] = $position->toOffset($dstW, $dstH, $wmW, $wmH);
 
-        imagecopymerge($dst, $wmImage, $x, $y, 0, 0, $wmW, $wmH, $opacity);
+        $this->mergeWithAlpha($dst, $wmImage, $x, $y, $wmW, $wmH, $opacity);
 
         return $this;
+    }
+
+    /**
+     * Copy $src onto $dst at the given opacity while honouring the alpha
+     * channel of $src.
+     *
+     * imagecopymerge() ignores alpha: the transparent areas of a PNG
+     * watermark would come out black. The watermark is therefore first
+     * blended onto a copy of the covered area, and that area is merged back.
+     */
+    private function mergeWithAlpha(GdImage $dst, GdImage $src, int $x, int $y, int $w, int $h, int $opacity): void
+    {
+        imagealphablending($dst, true);
+
+        if ($opacity === self::OPACITY_FULL) {
+            imagecopy($dst, $src, $x, $y, 0, 0, $w, $h);
+
+            return;
+        }
+
+        $area = $this->createCanvas($w, $h);
+        imagecopy($area, $dst, 0, 0, $x, $y, $w, $h);
+        imagecopy($area, $src, 0, 0, 0, 0, $w, $h);
+        imagecopymerge($dst, $area, $x, $y, 0, 0, $w, $h, $opacity);
     }
 
     public function text(
@@ -1309,8 +1343,9 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
         $clone->image   = $dst;
         $clone->format  = $this->format;
         $clone->quality = $this->quality;
-        $clone->exif    = $this->exif;
-        $clone->iptc    = $this->iptc;
+        $clone->exif      = $this->exif;
+        $clone->iptc      = $this->iptc;
+        $clone->maxPixels = $this->maxPixels;
 
         return $clone;
     }
@@ -1358,6 +1393,12 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
             throw new ImageLoadException(
                 'GD could not decode the provided image data.' . ($warning !== null ? ' ' . $warning : '')
             );
+        }
+
+        // A palette image (GIF, 8-bit PNG) runs out of colours as soon as
+        // something is drawn on it: work in true colour.
+        if (!imageistruecolor($image)) {
+            imagepalettetotruecolor($image);
         }
 
         imagealphablending($image, true);
@@ -1440,6 +1481,10 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
             );
         }
 
+        // Every operation that allocates a new canvas (resize, scale...) is
+        // bound by the limit, not only the decoding of the input.
+        $this->assertWithinPixelLimit($width, $height);
+
         $canvas = imagecreatetruecolor($width, $height);
         if ($canvas === false) {
             throw new ImageLoadException(
@@ -1489,6 +1534,29 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
     }
 
     /**
+     * Read the IPTC block (APP13 segment) of JPEG data, keyed like iptcparse().
+     *
+     * @return array<string, mixed>
+     */
+    private function readIptc(string $data): array
+    {
+        [$size] = $this->captureWarning(static function () use ($data, &$segments) {
+            return getimagesizefromstring($data, $segments);
+        });
+
+        if ($size === false || !is_array($segments) || !isset($segments['APP13']) || !is_string($segments['APP13'])) {
+            return [];
+        }
+
+        [$iptc] = $this->captureWarning(static fn () => iptcparse($segments['APP13']));
+
+        /** @var array<string, mixed> $parsed */
+        $parsed = is_array($iptc) ? $iptc : [];
+
+        return $parsed;
+    }
+
+    /**
      * Detect the image format from raw binary data via getimagesizefromstring().
      *
      * @throws ImageLoadException When the format cannot be determined or is unsupported.
@@ -1526,8 +1594,13 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
             throw new ImageSaveException('Failed to start output buffering for image encoding.');
         }
 
-        $ok   = $this->renderToBuffer($image, $format, $quality);
-        $data = ob_get_clean();
+        // Always closed, even when the encoder throws: a buffer left open
+        // would swallow the output of the following requests in a worker.
+        try {
+            $ok = $this->renderToBuffer($image, $format, $quality);
+        } finally {
+            $data = ob_get_clean();
+        }
 
         if (!$ok || $data === false || $data === '') {
             throw new ImageSaveException(
@@ -1588,8 +1661,19 @@ final class GDDriver implements DriverInterface, DriverAvailabilityInterface
     ): GdImage {
         $ratio = max($dstW / $srcW, $dstH / $srcH);
 
-        if (!$upscale) {
-            $ratio = min($ratio, 1.0);
+        // Without upscaling a source smaller than the target is never
+        // stretched: the canvas keeps the requested size and receives the
+        // source as is (cropped where it is larger), placed at $position.
+        if (!$upscale && $ratio > self::NO_SCALE) {
+            $cropW = min($dstW, $srcW);
+            $cropH = min($dstH, $srcH);
+            [$fromX, $fromY] = $position->toOffset($srcW, $srcH, $cropW, $cropH);
+            [$toX, $toY]     = $position->toOffset($dstW, $dstH, $cropW, $cropH);
+
+            $dst = $this->createCanvas($dstW, $dstH);
+            imagecopy($dst, $src, $toX, $toY, $fromX, $fromY, $cropW, $cropH);
+
+            return $dst;
         }
 
         // Size of the scaled source in destination pixels
