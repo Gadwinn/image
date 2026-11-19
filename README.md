@@ -57,12 +57,9 @@ $factory = new ImageFactory();
 $gd      = $factory->create(GDDriver::class);     // typed as GDDriver
 $imagick = $factory->create(ImagickDriver::class); // typed as ImagickDriver
 
-// Injecting a custom factory (DI container / test double)
-Image::setFactory($myCustomFactory);
-$driver = Image::create(GDDriver::class); // delegates to $myCustomFactory
-
-// Reset to the default factory
-Image::setFactory(null);
+// Custom factory (DI container / test double): the facade holds no state, so
+// depend on ImageFactoryInterface and inject ImageFactory or your own implementation
+$driver = $imageFactory->create(GDDriver::class);
 
 // First available driver — no extension_loaded() check needed by the caller
 $driver = Image::createFirstAvailable([GDDriver::class, ImagickDriver::class]);
@@ -438,13 +435,36 @@ $frame      = $anim->getFrame(0);                 // mixed — frame at index 0
 
 $delay      = $anim->getFrameDelay(0);            // int — milliseconds
 $loops      = $anim->getLoopCount();              // int (0 = infinite)
+
+// Every operation applies to all frames; GIF and WebP keep the animation
+$anim->resize(320, null)->grayscale()->toGif()->save('/path/to/small.gif');
+
+// Editing the animation
+$white = new Imagick();
+$white->newImage($anim->getWidth(), $anim->getHeight(), new ImagickPixel('white'), 'png');
+
+$anim->addFrame($white, 500)       // append, displayed 500 ms
+    ->addFrame($white, 100, 0)     // insert before the first frame
+    ->removeFrame(1)
+    ->setFrameDelay(0, 250)
+    ->setLoopCount(3);             // 0 = infinite
 ```
 
-Animation support is **read-only** in this version: `addFrame()`,
-`removeFrame()`, `setFrameDelay()` and `setLoopCount()` throw
-`UnsupportedOperationException` on both drivers, and operations and output
-work on the first frame only (an animated GIF is saved as a still image).
-`GDDriver` always reports a single frame.
+With `ImagickDriver`, an animation is **coalesced** when loaded: every frame
+becomes a full image of the canvas size. Then:
+
+- every operation (resize, crop, trim, rotate, filters, watermark, drawing...)
+  is applied to all frames; `trim()` keeps the box needed by the widest frame;
+- GIF and WebP outputs keep all frames, their delays and the loop count; the
+  other formats (JPEG, PNG, AVIF...) keep the first frame;
+- a frame added with `addFrame()` is an `Imagick` instance with the dimensions
+  of the image (its first image is used);
+- delays are given in milliseconds and stored in hundredths of a second, the
+  GIF precision (25 ms becomes 30 ms);
+- `limitPixels()` counts the pixels of all frames (width × height × frames).
+
+`GDDriver` always reports a single frame; its frame editing methods throw
+`UnsupportedOperationException`.
 
 ---
 
@@ -478,6 +498,7 @@ Most operations are supported identically by both drivers. The exceptions:
 |------------------------|:--------:|:-------------:|---|
 | `text.builtinFont`     | ✓ | ✗ | GD: `text()` with `fontPath: null` uses a built-in bitmap font. Imagick throws `UnsupportedOperationException` when `fontPath` is null — a TTF/OTF file is always required. |
 | `toTiff`, `toHeic`     | ✗ | ✓ | GD has no TIFF/HEIC encoder. |
+| `addFrame`, `removeFrame`, `setFrameDelay`, `setLoopCount` | ✗ | ✓ | GD only handles single frames. |
 
 Static driver availability (before an instance exists) is a separate check:
 

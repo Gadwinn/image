@@ -25,16 +25,12 @@ use G\Image\Factory\ImageFactoryInterface;
  *     ->save('/path/to/output.webp');
  * ```
  *
- * A custom factory can be injected (e.g. in tests or DI containers):
- * ```php
- * Image::setFactory(new MyCustomFactory());
- * ```
+ * The facade holds no state. To swap the factory (DI container, test double),
+ * depend on {@see ImageFactoryInterface} and inject {@see ImageFactory} or your
+ * own implementation instead of calling the facade.
  */
 final class Image
 {
-    /** @var ImageFactoryInterface<DriverInterface>|null */
-    private static ?ImageFactoryInterface $factory = null;
-
     /**
      * Prevent direct instantiation.
      *
@@ -42,19 +38,6 @@ final class Image
      */
     private function __construct()
     {
-    }
-
-    /**
-     * Override the default {@see ImageFactory} with a custom implementation.
-     *
-     * Useful for dependency injection or test doubles.
-     * Pass null to restore the default factory.
-     *
-     * @param ImageFactoryInterface<DriverInterface>|null $factory Custom factory, or null to reset.
-     */
-    public static function setFactory(?ImageFactoryInterface $factory): void
-    {
-        self::$factory = $factory;
     }
 
     /**
@@ -71,7 +54,7 @@ final class Image
      */
     public static function create(string $driverClass): DriverInterface
     {
-        return (self::$factory ?? new ImageFactory())->create($driverClass);
+        return (new ImageFactory())->create($driverClass);
     }
 
     /**

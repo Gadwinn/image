@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace G\Image\Driver;
 
+use Closure;
 use G\Image\Color\Color;
 use G\Image\Enum\Fit;
 use G\Image\Enum\Flip;
@@ -32,9 +33,12 @@ use Psr\Http\Message\StreamInterface;
  * Supported formats: JPEG, PNG, GIF, WebP, AVIF, TIFF, HEIC, BMP (availability
  * depends on the ImageMagick build).
  *
- * Animation: getFrameCount() and getFrames() return the actual frame data for
- * multi-frame images. Mutation methods (addFrame, removeFrame, setFrameDelay,
- * setLoopCount) throw {@see UnsupportedOperationException}.
+ * Animation: a multi-frame image is coalesced when loaded (every frame becomes a
+ * full image of the canvas size), every operation is applied to all frames, and
+ * GIF and WebP outputs keep the animation; the other formats keep the first frame.
+ * Frames are {@see Imagick} instances; delays are given in milliseconds and stored
+ * in hundredths of a second (the GIF precision). The pixel limit counts the pixels
+ * of all frames.
  *
  * EXIF: readable on load for JPEG; writing throws {@see UnsupportedOperationException}.
  */
@@ -56,6 +60,9 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
     // ─── GIF delay ticks per second when the image declares none ──────────────
     private const DEFAULT_TICKS_PER_SECOND = 100;
     private const MILLISECONDS_PER_SECOND  = 1000;
+
+    // ─── Output formats that keep every frame of an animation ─────────────────
+    private const ANIMATED_FORMATS = [Format::GIF, Format::WEBP];
 
     // ─── Filter level range ────────────────────────────────────────────────────
     private const LEVEL_MIN = -100;
@@ -106,6 +113,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         'watermark', 'text', 'rect', 'ellipse', 'line', 'arc',
         'getWidth', 'getHeight', 'getFormat', 'getExif', 'getIptc', 'stripMetadata',
         'getFrameCount', 'getFrames', 'getFrame', 'getFrameDelay', 'getLoopCount',
+        'addFrame', 'removeFrame', 'setFrameDelay', 'setLoopCount',
         'isLoaded', 'copy', 'destroy',
         'supportsFormat', 'supportsOperation', 'getSupportedFormats',
     ];
@@ -251,6 +259,12 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             $imagick = new Imagick();
             $imagick->readImageBlob($data);
             $imagick->setIteratorIndex(0);
+            $this->assertWithinPixelLimit(
+                $imagick->getImageWidth(),
+                $imagick->getImageHeight(),
+                $imagick->getNumberImages(),
+            );
+            $imagick = $this->coalesce($imagick);
         } catch (ImagickException $e) {
             throw new ImageLoadException(
                 'Imagick could not decode the provided image data.',
@@ -281,10 +295,16 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         if ($blob instanceof Imagick) {
             // Already decoded: only the existing dimensions can be checked, the
             // memory allocation (if any) already happened in the caller's code.
-            $this->assertWithinPixelLimit($blob->getImageWidth(), $blob->getImageHeight());
+            $this->assertWithinPixelLimit($blob->getImageWidth(), $blob->getImageHeight(), $blob->getNumberImages());
 
-            $this->imagick = clone $blob;
-            $this->imagick->setIteratorIndex(0);
+            try {
+                $imagick = clone $blob;
+                $imagick->setIteratorIndex(0);
+                $this->imagick = $this->coalesce($imagick);
+            } catch (ImagickException $e) {
+                throw new ImageLoadException('Imagick could not read the provided instance.', previous: $e);
+            }
+
             $this->format = $this->detectFormatFromImagick();
             $this->exif   = $this->readExif();
             $this->iptc   = [];
@@ -436,15 +456,13 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             $height = max(1, (int) round($srcH * $width / $srcW));
         }
 
-        $this->assertWithinPixelLimit($width, $height);
+        $this->assertWithinPixelLimit($width, $height, $image->getNumberImages());
 
-        if ($fit === Fit::FILL) {
-            $this->resizeFill($width, $height, $upscale);
-        } elseif ($fit === Fit::COVER) {
-            $this->resizeCover($width, $height, $position, $upscale);
-        } else {
-            $this->resizeContain($width, $height, $background, $upscale);
-        }
+        $this->eachFrame(match ($fit) {
+            Fit::FILL  => fn (Imagick $f): Imagick => $this->resizeFill($f, $width, $height, $upscale),
+            Fit::COVER => fn (Imagick $f): Imagick => $this->resizeCover($f, $width, $height, $position, $upscale),
+            default    => fn (Imagick $f): Imagick => $this->resizeContain($f, $width, $height, $background, $upscale),
+        });
 
         return $this;
     }
@@ -467,10 +485,12 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
-        $this->assertWithinPixelLimit($newW, $newH);
+        $this->assertWithinPixelLimit($newW, $newH, $image->getNumberImages());
 
         try {
-            $image->resizeImage($newW, $newH, Imagick::FILTER_LANCZOS, self::IMAGICK_FILTER_BLUR);
+            $this->eachFrame(static function (Imagick $frame) use ($newW, $newH): void {
+                $frame->resizeImage($newW, $newH, Imagick::FILTER_LANCZOS, self::IMAGICK_FILTER_BLUR);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to scale the image.', previous: $e);
         }
@@ -501,8 +521,10 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         }
 
         try {
-            $image->cropImage($width, $height, $x, $y);
-            $image->setImagePage($width, $height, 0, 0);
+            $this->eachFrame(static function (Imagick $frame) use ($width, $height, $x, $y): void {
+                $frame->cropImage($width, $height, $x, $y);
+                $frame->setImagePage($width, $height, 0, 0);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to crop the image.', previous: $e);
         }
@@ -531,6 +553,12 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             $quantum = Imagick::getQuantumRange();
             $fuzz    = $threshold / self::CHANNEL_MAX * $quantum['quantumRangeLong'];
 
+            if ($image->getNumberImages() > 1) {
+                $this->trimFrames($image, $refPixel, $fuzz);
+
+                return $this;
+            }
+
             $image->trimImage($fuzz);
             $image->setImagePage($image->getImageWidth(), $image->getImageHeight(), 0, 0);
         } catch (ImagickException $e) {
@@ -554,9 +582,14 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
         $bg = $background ?? Color::transparent();
 
+        $pixel = $this->toImagickPixel($bg);
+
         try {
             // Imagick rotates clockwise — matches our API (no negation needed)
-            $this->requireImage()->rotateImage($this->toImagickPixel($bg), $angle);
+            $this->eachFrame(static function (Imagick $frame) use ($pixel, $angle): void {
+                $frame->rotateImage($pixel, $angle);
+                $frame->setImagePage($frame->getImageWidth(), $frame->getImageHeight(), 0, 0);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to rotate the image.', previous: $e);
         }
@@ -566,18 +599,18 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
     public function flip(Flip $direction): static
     {
-        $image = $this->requireImage();
-
         try {
-            if ($direction === Flip::HORIZONTAL || $direction === Flip::BOTH) {
-                // flopImage = horizontal flip (mirror left-right)
-                $image->flopImage();
-            }
+            $this->eachFrame(static function (Imagick $frame) use ($direction): void {
+                if ($direction === Flip::HORIZONTAL || $direction === Flip::BOTH) {
+                    // flopImage = horizontal flip (mirror left-right)
+                    $frame->flopImage();
+                }
 
-            if ($direction === Flip::VERTICAL || $direction === Flip::BOTH) {
-                // flipImage = vertical flip (mirror top-bottom)
-                $image->flipImage();
-            }
+                if ($direction === Flip::VERTICAL || $direction === Flip::BOTH) {
+                    // flipImage = vertical flip (mirror top-bottom)
+                    $frame->flipImage();
+                }
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to flip the image.', previous: $e);
         }
@@ -597,12 +630,12 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
-        $image = $this->requireImage();
-
         try {
-            for ($i = 0; $i < $amount; $i++) {
-                $image->gaussianBlurImage(self::BLUR_RADIUS, self::BLUR_SIGMA);
-            }
+            $this->eachFrame(static function (Imagick $frame) use ($amount): void {
+                for ($i = 0; $i < $amount; $i++) {
+                    $frame->gaussianBlurImage(self::BLUR_RADIUS, self::BLUR_SIGMA);
+                }
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to apply blur.', previous: $e);
         }
@@ -618,13 +651,13 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
-        $image = $this->requireImage();
-
         try {
-            for ($i = 0; $i < $amount; $i++) {
-                // radius=0 lets Imagick auto-calculate; sigma controls the spread
-                $image->unsharpMaskImage(0.0, self::SHARPEN_SIGMA, self::SHARPEN_AMOUNT, self::SHARPEN_THRESHOLD);
-            }
+            $this->eachFrame(static function (Imagick $frame) use ($amount): void {
+                for ($i = 0; $i < $amount; $i++) {
+                    // radius=0 lets Imagick auto-calculate; sigma controls the spread
+                    $frame->unsharpMaskImage(0.0, self::SHARPEN_SIGMA, self::SHARPEN_AMOUNT, self::SHARPEN_THRESHOLD);
+                }
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to apply sharpening.', previous: $e);
         }
@@ -644,11 +677,13 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         $modulateBrightness = (float) (self::MODULATE_NEUTRAL + $level);
 
         try {
-            $this->requireImage()->modulateImage(
-                $modulateBrightness,
-                (float) self::MODULATE_NEUTRAL,
-                (float) self::MODULATE_NEUTRAL,
-            );
+            $this->eachFrame(static function (Imagick $frame) use ($modulateBrightness): void {
+                $frame->modulateImage(
+                    $modulateBrightness,
+                    (float) self::MODULATE_NEUTRAL,
+                    (float) self::MODULATE_NEUTRAL,
+                );
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to adjust brightness.', previous: $e);
         }
@@ -666,7 +701,9 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
         try {
             // brightnessContrastImage: positive = more contrast, matching our API
-            $this->requireImage()->brightnessContrastImage(0.0, (float) $level);
+            $this->eachFrame(static function (Imagick $frame) use ($level): void {
+                $frame->brightnessContrastImage(0.0, (float) $level);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to adjust contrast.', previous: $e);
         }
@@ -677,10 +714,11 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
     public function grayscale(): static
     {
         try {
-            $image = $this->requireImage();
-            $image->transformImageColorspace(Imagick::COLORSPACE_GRAY);
-            // Convert back to sRGB to maintain broad format compatibility
-            $image->transformImageColorspace(Imagick::COLORSPACE_SRGB);
+            $this->eachFrame(static function (Imagick $frame): void {
+                $frame->transformImageColorspace(Imagick::COLORSPACE_GRAY);
+                // Convert back to sRGB to maintain broad format compatibility
+                $frame->transformImageColorspace(Imagick::COLORSPACE_SRGB);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to apply grayscale.', previous: $e);
         }
@@ -691,7 +729,9 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
     public function negate(): static
     {
         try {
-            $this->requireImage()->negateImage(false);
+            $this->eachFrame(static function (Imagick $frame): void {
+                $frame->negateImage(false);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to negate the image.', previous: $e);
         }
@@ -704,7 +744,9 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         try {
             $quantum = Imagick::getQuantumRange();
             $threshold = self::SEPIA_THRESHOLD_RATIO * $quantum['quantumRangeLong'];
-            $this->requireImage()->sepiaToneImage($threshold);
+            $this->eachFrame(static function (Imagick $frame) use ($threshold): void {
+                $frame->sepiaToneImage($threshold);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to apply sepia tone.', previous: $e);
         }
@@ -715,7 +757,9 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
     public function emboss(): static
     {
         try {
-            $this->requireImage()->embossImage(self::EMBOSS_RADIUS, self::EMBOSS_SIGMA);
+            $this->eachFrame(static function (Imagick $frame): void {
+                $frame->embossImage(self::EMBOSS_RADIUS, self::EMBOSS_SIGMA);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to apply emboss.', previous: $e);
         }
@@ -863,7 +907,8 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
         // Same-driver fast path: share the Imagick pixel data directly
         if ($watermark instanceof self && $watermark->imagick !== null) {
-            $wmImagick = clone $watermark->imagick;
+            // First frame only: an animated watermark is laid as a still image
+            $wmImagick = $this->framesOf($watermark->imagick)[0];
         } elseif ($watermark instanceof OutputInterface) {
             try {
                 $wmData = $watermark->toString();
@@ -900,7 +945,9 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
 
             [$x, $y] = $position->toOffset($dstW, $dstH, $wmW, $wmH);
 
-            $dst->compositeImage($wmImagick, Imagick::COMPOSITE_OVER, $x, $y);
+            $this->eachFrame(static function (Imagick $frame) use ($wmImagick, $x, $y): void {
+                $frame->compositeImage($wmImagick, Imagick::COMPOSITE_OVER, $x, $y);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to composite the watermark.', previous: $e);
         }
@@ -955,7 +1002,9 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             $baselineY = $topY + $ascender;
 
             // annotateImage angle: clockwise degrees, matching our API
-            $image->annotateImage($draw, $originX, $baselineY, $angle, $content);
+            $this->eachFrame(static function (Imagick $f) use ($draw, $originX, $baselineY, $angle, $content): void {
+                $f->annotateImage($draw, $originX, $baselineY, $angle, $content);
+            });
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to render text.', previous: $e);
         }
@@ -977,7 +1026,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
-        $image = $this->requireImage();
+        $this->requireImage();
         $x2    = $x + $width - 1;
         $y2    = $y + $height - 1;
 
@@ -988,7 +1037,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
                 $draw->setStrokeWidth(0.0);
                 $draw->setStrokeColor(new ImagickPixel('none'));
                 $draw->rectangle((float) $x, (float) $y, (float) $x2, (float) $y2);
-                $image->drawImage($draw);
+                $this->drawOnFrames($draw);
             }
 
             if (!$stroke->isTransparent()) {
@@ -997,7 +1046,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
                 $draw->setStrokeColor($this->toImagickPixel($stroke));
                 $draw->setStrokeWidth(self::STROKE_WIDTH_THIN);
                 $draw->rectangle((float) $x, (float) $y, (float) $x2, (float) $y2);
-                $image->drawImage($draw);
+                $this->drawOnFrames($draw);
             }
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to draw rectangle.', previous: $e);
@@ -1020,7 +1069,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
-        $image = $this->requireImage();
+        $this->requireImage();
         $rx    = $width  / self::CENTER_DIVISOR;
         $ry    = $height / self::CENTER_DIVISOR;
 
@@ -1031,7 +1080,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
                 $draw->setStrokeWidth(0.0);
                 $draw->setStrokeColor(new ImagickPixel('none'));
                 $draw->ellipse((float) $cx, (float) $cy, $rx, $ry, 0.0, self::FULL_CIRCLE_DEG);
-                $image->drawImage($draw);
+                $this->drawOnFrames($draw);
             }
 
             if (!$stroke->isTransparent()) {
@@ -1040,7 +1089,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
                 $draw->setStrokeColor($this->toImagickPixel($stroke));
                 $draw->setStrokeWidth(self::STROKE_WIDTH_THIN);
                 $draw->ellipse((float) $cx, (float) $cy, $rx, $ry, 0.0, self::FULL_CIRCLE_DEG);
-                $image->drawImage($draw);
+                $this->drawOnFrames($draw);
             }
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to draw ellipse.', previous: $e);
@@ -1057,7 +1106,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             $draw->setStrokeWidth(self::STROKE_WIDTH_THIN);
             $draw->setFillColor(new ImagickPixel('none'));
             $draw->line((float) $x1, (float) $y1, (float) $x2, (float) $y2);
-            $this->requireImage()->drawImage($draw);
+            $this->drawOnFrames($draw);
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to draw line.', previous: $e);
         }
@@ -1081,7 +1130,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             );
         }
 
-        $image = $this->requireImage();
+        $this->requireImage();
         $rx    = $width  / self::CENTER_DIVISOR;
         $ry    = $height / self::CENTER_DIVISOR;
 
@@ -1106,7 +1155,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
                 $draw->pathEllipticArcAbsolute($rx, $ry, 0.0, $largeArc, true, $endX, $endY);
                 $draw->pathClose();
                 $draw->pathFinish();
-                $image->drawImage($draw);
+                $this->drawOnFrames($draw);
             }
 
             if (!$stroke->isTransparent()) {
@@ -1119,7 +1168,7 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
                 $draw->setStrokeColor($this->toImagickPixel($stroke));
                 $draw->setStrokeWidth(self::STROKE_WIDTH_THIN);
                 $draw->arc($bx1, $by1, $bx2, $by2, (float) $startAngle, (float) $endAngle);
-                $image->drawImage($draw);
+                $this->drawOnFrames($draw);
             }
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to draw arc.', previous: $e);
@@ -1216,29 +1265,12 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             return [];
         }
 
-        $frames = [];
-        $count  = $this->imagick->getNumberImages();
-
-        for ($i = 0; $i < $count; $i++) {
-            $this->imagick->setIteratorIndex($i);
-            $frames[] = $this->imagick->getImage();
-        }
-
-        // Reset iterator to first frame
-        $this->imagick->setIteratorIndex(0);
-
-        return $frames;
+        return $this->framesOf($this->imagick);
     }
 
     public function getFrame(int $index): mixed
     {
-        $count = $this->getFrameCount();
-
-        if (!$this->isLoaded() || $index < 0 || $index >= $count) {
-            throw new InvalidImageArgumentException(
-                sprintf('Frame index %d is out of bounds (ImagickDriver has %d frame(s)).', $index, $count)
-            );
-        }
+        $this->assertFrameIndex($index);
 
         /** @var Imagick $imagick */
         $imagick = $this->imagick;
@@ -1249,29 +1281,86 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         return $frame;
     }
 
+    /**
+     * The frame is an {@see Imagick} instance (its first image is used) with the
+     * dimensions of the loaded image.
+     */
     public function addFrame(mixed $frame, int $delay, ?int $index = null): static
     {
-        throw new UnsupportedOperationException(
-            'ImagickDriver does not support adding animation frames in this version.'
-        );
+        $image = $this->requireImage();
+        $count = $image->getNumberImages();
+        $index ??= $count;
+
+        if (!$frame instanceof Imagick) {
+            throw new InvalidImageArgumentException('ImagickDriver::addFrame() expects an Imagick instance.');
+        }
+
+        $this->assertDelay($delay);
+
+        if ($index < 0 || $index > $count) {
+            throw new InvalidImageArgumentException(
+                sprintf('Frame insertion index %d is out of bounds (0 to %d).', $index, $count)
+            );
+        }
+
+        try {
+            $new = $this->framesOf($frame)[0];
+            $width  = $image->getImageWidth();
+            $height = $image->getImageHeight();
+
+            if ($new->getImageWidth() !== $width || $new->getImageHeight() !== $height) {
+                throw new InvalidImageArgumentException(sprintf(
+                    'The frame must measure %d×%d, like the image; %d×%d given.',
+                    $width,
+                    $height,
+                    $new->getImageWidth(),
+                    $new->getImageHeight(),
+                ));
+            }
+
+            $this->assertWithinPixelLimit($width, $height, $count + 1);
+
+            $new->setImagePage($width, $height, 0, 0);
+            $new->setImageIterations($image->getImageIterations());
+            $this->applyDelay($new, $delay);
+
+            $frames = $this->framesOf($image);
+            array_splice($frames, $index, 0, [$new]);
+            $this->imagick = $this->sequence($frames);
+        } catch (ImagickException $e) {
+            throw new InvalidImageArgumentException('Imagick could not add the frame.', previous: $e);
+        }
+
+        return $this;
     }
 
     public function removeFrame(int $index): static
     {
-        throw new UnsupportedOperationException(
-            'ImagickDriver does not support removing animation frames in this version.'
-        );
+        $this->assertFrameIndex($index);
+
+        /** @var Imagick $image */
+        $image = $this->imagick;
+        if ($image->getNumberImages() === 1) {
+            throw new InvalidImageArgumentException('The only frame of an image cannot be removed.');
+        }
+
+        try {
+            $frames = $this->framesOf($image);
+            $iterations = $image->getImageIterations();
+            array_splice($frames, $index, 1);
+            /** @var non-empty-list<Imagick> $frames */
+            $frames[0]->setImageIterations($iterations);
+            $this->imagick = $this->sequence($frames);
+        } catch (ImagickException $e) {
+            throw new ImageLoadException('Imagick could not remove the frame.', previous: $e);
+        }
+
+        return $this;
     }
 
     public function getFrameDelay(int $index): int
     {
-        $count = $this->getFrameCount();
-
-        if (!$this->isLoaded() || $index < 0 || $index >= $count) {
-            throw new InvalidImageArgumentException(
-                sprintf('Frame index %d is out of bounds (ImagickDriver has %d frame(s)).', $index, $count)
-            );
-        }
+        $this->assertFrameIndex($index);
 
         /** @var Imagick $imagick */
         $imagick = $this->imagick;
@@ -1286,23 +1375,64 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         return intdiv($delay * self::MILLISECONDS_PER_SECOND, $ticks);
     }
 
+    /**
+     * The delay is stored in hundredths of a second (GIF precision): 25 ms becomes 30 ms.
+     */
     public function setFrameDelay(int $index, int $delay): static
     {
-        throw new UnsupportedOperationException(
-            'ImagickDriver does not support setting frame delays in this version.'
-        );
+        $this->assertFrameIndex($index);
+        $this->assertDelay($delay);
+
+        /** @var Imagick $imagick */
+        $imagick = $this->imagick;
+
+        try {
+            $imagick->setIteratorIndex($index);
+            $this->applyDelay($imagick, $delay);
+        } catch (ImagickException $e) {
+            throw new InvalidImageArgumentException('Imagick could not set the frame delay.', previous: $e);
+        } finally {
+            $imagick->setIteratorIndex(0);
+        }
+
+        return $this;
     }
 
     public function getLoopCount(): int
     {
-        return $this->imagick !== null ? max(0, $this->imagick->getImageIterations()) : 0;
+        if ($this->imagick === null) {
+            return 0;
+        }
+
+        $this->imagick->setIteratorIndex(0);
+
+        return max(0, $this->imagick->getImageIterations());
     }
 
     public function setLoopCount(int $count): static
     {
-        throw new UnsupportedOperationException(
-            'ImagickDriver does not support setting animation loop count in this version.'
-        );
+        if ($count < 0) {
+            throw new InvalidImageArgumentException(
+                sprintf('Loop count must be zero (infinite) or a positive integer, %d given.', $count)
+            );
+        }
+
+        $imagick = $this->requireImage();
+
+        try {
+            // Every frame carries it: GIF reads the first one, other writers may read any
+            $frames = $imagick->getNumberImages();
+            for ($i = 0; $i < $frames; $i++) {
+                $imagick->setIteratorIndex($i);
+                $imagick->setImageIterations($count);
+            }
+        } catch (ImagickException $e) {
+            throw new InvalidImageArgumentException('Imagick could not set the loop count.', previous: $e);
+        } finally {
+            $imagick->setIteratorIndex(0);
+        }
+
+        return $this;
     }
 
     // =========================================================================
@@ -1406,15 +1536,17 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
      *
      * No-op when no limit is configured (default).
      *
+     * @param int $frames Number of frames of these dimensions (all of them are held in memory).
+     *
      * @throws ImageLimitExceededException When the limit is configured and exceeded.
      */
-    private function assertWithinPixelLimit(int $width, int $height): void
+    private function assertWithinPixelLimit(int $width, int $height, int $frames = 1): void
     {
         if ($this->maxPixels === null) {
             return;
         }
 
-        $pixelCount = $width * $height;
+        $pixelCount = $width * $height * max(1, $frames);
         if ($pixelCount > $this->maxPixels) {
             throw new ImageLimitExceededException($pixelCount, $this->maxPixels);
         }
@@ -1510,11 +1642,29 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
     private function encode(Imagick $image, Format $format, ?int $quality): string
     {
         try {
-            $clone = clone $image;
-            $clone->setImageFormat($this->formatToImagickString($format));
-            $clone->setImageCompressionQuality($this->imagickQuality($format, $quality));
+            $magick      = $this->formatToImagickString($format);
+            $compression = $this->imagickQuality($format, $quality);
+            $frames      = $this->framesOf($image);
 
-            return $clone->getImageBlob();
+            // Formats without animation keep the first frame
+            if (count($frames) === 1 || !in_array($format, self::ANIMATED_FORMATS, strict: true)) {
+                $frames[0]->setImageFormat($magick);
+                $frames[0]->setImageCompressionQuality($compression);
+
+                return $frames[0]->getImageBlob();
+            }
+
+            foreach ($frames as $frame) {
+                $frame->setImageFormat($magick);
+                $frame->setImageCompressionQuality($compression);
+                // Frames are coalesced (full images): each one replaces the previous
+                $frame->setImageDispose(Imagick::DISPOSE_BACKGROUND);
+            }
+
+            $sequence = $this->sequence($frames);
+            $sequence->setFormat($magick);
+
+            return $sequence->getImagesBlob();
         } catch (ImagickException $e) {
             throw new ImageSaveException(
                 sprintf('Imagick failed to encode the image as %s.', $format->value),
@@ -1614,40 +1764,40 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         );
     }
 
+
     // ─── Resize helpers ───────────────────────────────────────────────────────
 
     /**
-     * Resize to exact dimensions, optionally preventing upscaling.
+     * Resize a frame to exact dimensions, optionally preventing upscaling.
      *
      * @throws ImageLoadException On Imagick failure.
      */
-    private function resizeFill(int $dstW, int $dstH, bool $upscale): void
+    private function resizeFill(Imagick $frame, int $dstW, int $dstH, bool $upscale): Imagick
     {
-        $image = $this->requireImage();
-
         if (!$upscale) {
-            $dstW = min($dstW, $image->getImageWidth());
-            $dstH = min($dstH, $image->getImageHeight());
+            $dstW = min($dstW, $frame->getImageWidth());
+            $dstH = min($dstH, $frame->getImageHeight());
         }
 
         try {
-            $image->resizeImage($dstW, $dstH, Imagick::FILTER_LANCZOS, self::IMAGICK_FILTER_BLUR);
+            $frame->resizeImage($dstW, $dstH, Imagick::FILTER_LANCZOS, self::IMAGICK_FILTER_BLUR);
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to resize (fill).', previous: $e);
         }
+
+        return $frame;
     }
 
     /**
-     * Scale to cover the target area, then crop to center.
+     * Scale a frame to cover the target area, then crop it at $position.
      *
      * @throws ImageLoadException On Imagick failure.
      */
-    private function resizeCover(int $dstW, int $dstH, Position $position, bool $upscale): void
+    private function resizeCover(Imagick $frame, int $dstW, int $dstH, Position $position, bool $upscale): Imagick
     {
-        $image  = $this->requireImage();
-        $srcW   = $image->getImageWidth();
-        $srcH   = $image->getImageHeight();
-        $ratio  = max($dstW / $srcW, $dstH / $srcH);
+        $srcW  = $frame->getImageWidth();
+        $srcH  = $frame->getImageHeight();
+        $ratio = max($dstW / $srcW, $dstH / $srcH);
 
         // Without upscaling a source smaller than the target is never
         // stretched: the canvas keeps the requested size and receives the
@@ -1659,19 +1809,17 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
             [$toX, $toY]     = $position->toOffset($dstW, $dstH, $cropW, $cropH);
 
             try {
-                $image->cropImage($cropW, $cropH, $fromX, $fromY);
-                $image->setImagePage(0, 0, 0, 0);
+                $frame->cropImage($cropW, $cropH, $fromX, $fromY);
+                $frame->setImagePage(0, 0, 0, 0);
 
                 $canvas = new Imagick();
                 $canvas->newImage($dstW, $dstH, $this->toImagickPixel(Color::transparent()), 'png');
-                $canvas->compositeImage($image, Imagick::COMPOSITE_OVER, $toX, $toY);
-
-                $this->imagick = $canvas;
+                $canvas->compositeImage($frame, Imagick::COMPOSITE_OVER, $toX, $toY);
             } catch (ImagickException $e) {
                 throw new ImageLoadException('Imagick failed to resize (cover).', previous: $e);
             }
 
-            return;
+            return $canvas;
         }
 
         $scaledW = max(1, (int) round($srcW * $ratio));
@@ -1682,28 +1830,29 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         $cropY = max(0, $cropY);
 
         try {
-            $image->resizeImage($scaledW, $scaledH, Imagick::FILTER_LANCZOS, self::IMAGICK_FILTER_BLUR);
-            $image->cropImage($dstW, $dstH, $cropX, $cropY);
-            $image->setImagePage($dstW, $dstH, 0, 0);
+            $frame->resizeImage($scaledW, $scaledH, Imagick::FILTER_LANCZOS, self::IMAGICK_FILTER_BLUR);
+            $frame->cropImage($dstW, $dstH, $cropX, $cropY);
+            $frame->setImagePage($dstW, $dstH, 0, 0);
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to resize (cover).', previous: $e);
         }
+
+        return $frame;
     }
 
     /**
-     * Fit within the target area, then pad with background to reach exact dimensions.
+     * Fit a frame within the target area, then pad it with background to reach exact dimensions.
      *
      * @throws ImageLoadException On Imagick failure.
      */
-    private function resizeContain(int $dstW, int $dstH, ?Color $background, bool $upscale): void
+    private function resizeContain(Imagick $frame, int $dstW, int $dstH, ?Color $background, bool $upscale): Imagick
     {
-        $image = $this->requireImage();
-        $srcW  = $image->getImageWidth();
-        $srcH  = $image->getImageHeight();
+        $srcW  = $frame->getImageWidth();
+        $srcH  = $frame->getImageHeight();
         $ratio = min($dstW / $srcW, $dstH / $srcH);
 
         if (!$upscale) {
-            $ratio = min($ratio, 1.0);
+            $ratio = min($ratio, self::NO_SCALE);
         }
 
         $fitW    = max(1, (int) round($srcW * $ratio));
@@ -1712,16 +1861,215 @@ final class ImagickDriver implements DriverInterface, DriverAvailabilityInterfac
         $offsetY = (int) (($dstH - $fitH) / self::CENTER_DIVISOR);
 
         try {
-            $image->resizeImage($fitW, $fitH, Imagick::FILTER_LANCZOS, self::IMAGICK_FILTER_BLUR);
+            $frame->resizeImage($fitW, $fitH, Imagick::FILTER_LANCZOS, self::IMAGICK_FILTER_BLUR);
 
             $bg     = $background ?? Color::transparent();
             $canvas = new Imagick();
             $canvas->newImage($dstW, $dstH, $this->toImagickPixel($bg), 'png');
-            $canvas->compositeImage($image, Imagick::COMPOSITE_OVER, $offsetX, $offsetY);
-
-            $this->imagick = $canvas;
+            $canvas->compositeImage($frame, Imagick::COMPOSITE_OVER, $offsetX, $offsetY);
         } catch (ImagickException $e) {
             throw new ImageLoadException('Imagick failed to resize (contain).', previous: $e);
         }
+
+        return $canvas;
+    }
+
+    // ─── Frame helpers ────────────────────────────────────────────────────────
+
+    /**
+     * Apply an operation to every frame of the loaded image.
+     *
+     * The operation changes the frame in place, or returns the frame replacing it
+     * (a new canvas); a replacing frame inherits the timing of the original one.
+     *
+     * @param Closure(Imagick): (Imagick|void) $operation
+     *
+     * @throws ImagickException
+     */
+    private function eachFrame(Closure $operation): void
+    {
+        $image = $this->requireImage();
+
+        if ($image->getNumberImages() === 1) {
+            $result = $operation($image);
+            if ($result instanceof Imagick) {
+                $this->imagick = $result;
+            }
+
+            return;
+        }
+
+        $frames = [];
+        foreach ($this->framesOf($image) as $frame) {
+            $result = $operation($frame);
+            if ($result instanceof Imagick && $result !== $frame) {
+                $this->copyTiming($frame, $result);
+                $frame = $result;
+            }
+
+            $frames[] = $frame;
+        }
+
+        $this->imagick = $this->sequence($frames);
+    }
+
+    /**
+     * Draw on every frame of the loaded image.
+     *
+     * @throws ImagickException
+     */
+    private function drawOnFrames(ImagickDraw $draw): void
+    {
+        $this->eachFrame(static function (Imagick $frame) use ($draw): void {
+            $frame->drawImage($draw);
+        });
+    }
+
+    /**
+     * Trim every frame to the same box: the union of what each frame would keep.
+     *
+     * @throws ImagickException
+     */
+    private function trimFrames(Imagick $image, ImagickPixel $reference, float $fuzz): void
+    {
+        $left   = PHP_INT_MAX;
+        $top    = PHP_INT_MAX;
+        $right  = 0;
+        $bottom = 0;
+
+        foreach ($this->framesOf($image) as $frame) {
+            $frame->setImageBackgroundColor($reference);
+            $frame->trimImage($fuzz);
+            $page   = $frame->getImagePage();
+            $left   = min($left, $page['x']);
+            $top    = min($top, $page['y']);
+            $right  = max($right, $page['x'] + $frame->getImageWidth());
+            $bottom = max($bottom, $page['y'] + $frame->getImageHeight());
+        }
+
+        $width  = $right - $left;
+        $height = $bottom - $top;
+
+        $this->eachFrame(static function (Imagick $frame) use ($width, $height, $left, $top): void {
+            $frame->cropImage($width, $height, $left, $top);
+            $frame->setImagePage($width, $height, 0, 0);
+        });
+    }
+
+    /**
+     * Each image of a sequence as a separate Imagick instance, in order.
+     *
+     * @return non-empty-list<Imagick>
+     *
+     * @throws ImagickException
+     */
+    private function framesOf(Imagick $image): array
+    {
+        $current = $image->getIteratorIndex();
+        $frames  = [];
+        $count   = $image->getNumberImages();
+
+        for ($i = 0; $i < $count; $i++) {
+            $image->setIteratorIndex($i);
+            $frames[] = $image->getImage();
+        }
+
+        $image->setIteratorIndex($current);
+
+        if ($frames === []) {
+            throw new ImageLoadException('The image has no frame.');
+        }
+
+        return $frames;
+    }
+
+    /**
+     * Assemble frames into one sequence, positioned on its first frame.
+     *
+     * @param non-empty-list<Imagick> $frames
+     *
+     * @throws ImagickException
+     */
+    private function sequence(array $frames): Imagick
+    {
+        $sequence = new Imagick();
+        foreach ($frames as $frame) {
+            $sequence->addImage($frame);
+        }
+
+        $sequence->setIteratorIndex(0);
+
+        return $sequence;
+    }
+
+    /**
+     * Coalesce an animation: every frame becomes a full image of the canvas size,
+     * so that operations and frame edits never see partial frames.
+     *
+     * @throws ImagickException
+     */
+    private function coalesce(Imagick $image): Imagick
+    {
+        if ($image->getNumberImages() <= 1) {
+            return $image;
+        }
+
+        $coalesced = $image->coalesceImages();
+        $coalesced->setIteratorIndex(0);
+
+        return $coalesced;
+    }
+
+    /**
+     * Copy the animation settings of a frame to the frame replacing it.
+     *
+     * @throws ImagickException
+     */
+    private function copyTiming(Imagick $from, Imagick $to): void
+    {
+        $to->setImageDelay($from->getImageDelay());
+        $to->setImageTicksPerSecond($from->getImageTicksPerSecond());
+        $to->setImageIterations($from->getImageIterations());
+    }
+
+    /**
+     * Throw unless $index designates an existing frame.
+     *
+     * @throws InvalidImageArgumentException
+     */
+    private function assertFrameIndex(int $index): void
+    {
+        $count = $this->getFrameCount();
+
+        if (!$this->isLoaded() || $index < 0 || $index >= $count) {
+            throw new InvalidImageArgumentException(
+                sprintf('Frame index %d is out of bounds (ImagickDriver has %d frame(s)).', $index, $count)
+            );
+        }
+    }
+
+    /**
+     * @throws InvalidImageArgumentException When the delay is negative.
+     */
+    private function assertDelay(int $delay): void
+    {
+        if ($delay < 0) {
+            throw new InvalidImageArgumentException(
+                sprintf('Frame delay must be zero or a positive number of milliseconds, %d given.', $delay)
+            );
+        }
+    }
+
+    /**
+     * Store a delay given in milliseconds, in hundredths of a second (GIF precision).
+     *
+     * @throws ImagickException
+     */
+    private function applyDelay(Imagick $frame, int $delay): void
+    {
+        $frame->setImageTicksPerSecond(self::DEFAULT_TICKS_PER_SECOND);
+        $frame->setImageDelay(
+            (int) round($delay * self::DEFAULT_TICKS_PER_SECOND / self::MILLISECONDS_PER_SECOND)
+        );
     }
 }
