@@ -57,12 +57,9 @@ $factory = new ImageFactory();
 $gd      = $factory->create(GDDriver::class);     // typed as GDDriver
 $imagick = $factory->create(ImagickDriver::class); // typed as ImagickDriver
 
-// Injecting a custom factory (DI container / test double)
-Image::setFactory($myCustomFactory);
-$driver = Image::create(GDDriver::class); // delegates to $myCustomFactory
-
-// Reset to the default factory
-Image::setFactory(null);
+// Custom factory (DI container / test double): the facade holds no state, so
+// depend on ImageFactoryInterface and inject ImageFactory or your own implementation
+$driver = $imageFactory->create(GDDriver::class);
 
 // First available driver — no extension_loaded() check needed by the caller
 $driver = Image::createFirstAvailable([GDDriver::class, ImagickDriver::class]);

@@ -4,10 +4,8 @@ declare(strict_types=1);
 
 namespace G\Image\Tests;
 
-use G\Image\Driver\DriverInterface;
 use G\Image\Driver\GDDriver;
 use G\Image\Exception\UnsupportedOperationException;
-use G\Image\Factory\ImageFactoryInterface;
 use G\Image\Image;
 use G\Image\Tests\Fixture\UnavailableFakeDriver;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -18,12 +16,6 @@ use PHPUnit\Framework\TestCase;
 #[RequiresPhpExtension('gd')]
 final class ImageTest extends TestCase
 {
-    protected function tearDown(): void
-    {
-        // Reset static factory state after every test.
-        Image::setFactory(null);
-    }
-
     public function testCreateReturnsDriverInstanceWithDefaultFactory(): void
     {
         $driver = Image::create(GDDriver::class);
@@ -31,41 +23,9 @@ final class ImageTest extends TestCase
         self::assertInstanceOf(GDDriver::class, $driver);
     }
 
-    public function testSetFactoryOverridesDefaultForSubsequentCreates(): void
+    public function testCreateReturnsANewDriverOnEveryCall(): void
     {
-        $expectedDriver = new GDDriver();
-
-        $mockFactory = new class ($expectedDriver) implements ImageFactoryInterface {
-            public function __construct(private readonly DriverInterface $driver) {}
-
-            public function create(string $driverClass): DriverInterface
-            {
-                return $this->driver;
-            }
-        };
-
-        Image::setFactory($mockFactory);
-        $result = Image::create(GDDriver::class);
-
-        self::assertSame($expectedDriver, $result);
-    }
-
-    public function testSetFactoryNullResetsToDefaultFactory(): void
-    {
-        // Override factory, then reset.
-        $mockFactory = new class implements ImageFactoryInterface {
-            public function create(string $driverClass): DriverInterface
-            {
-                return new GDDriver();
-            }
-        };
-
-        Image::setFactory($mockFactory);
-        Image::setFactory(null);
-
-        // After reset, the default ImageFactory should be used.
-        $driver = Image::create(GDDriver::class);
-        self::assertInstanceOf(GDDriver::class, $driver);
+        self::assertNotSame(Image::create(GDDriver::class), Image::create(GDDriver::class));
     }
 
     public function testCreateFirstAvailableReturnsFirstAvailableDriver(): void
