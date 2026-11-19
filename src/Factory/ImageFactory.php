@@ -13,7 +13,7 @@ use G\Image\Exception\InvalidImageArgumentException;
  *
  * The driver class must have a public no-argument constructor.
  * If the driver requires dependencies, extend this class or provide a custom
- * {@see ImageFactoryInterface} implementation via {@see \G\Image\Image::setFactory()}.
+ * {@see ImageFactoryInterface} implementation and inject it where drivers are created.
  *
  * @template T of DriverInterface
  * @implements ImageFactoryInterface<T>
