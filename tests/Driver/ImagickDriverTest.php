@@ -805,18 +805,6 @@ final class ImagickDriverTest extends TestCase
         $this->loaded()->getFrame(1);
     }
 
-    public function testAddFrameThrowsUnsupportedOperationException(): void
-    {
-        $this->expectException(UnsupportedOperationException::class);
-        $this->loaded()->addFrame(null, 100);
-    }
-
-    public function testRemoveFrameThrowsUnsupportedOperationException(): void
-    {
-        $this->expectException(UnsupportedOperationException::class);
-        $this->loaded()->removeFrame(0);
-    }
-
     public function testGetFrameDelayReturns0ForSingleFramePng(): void
     {
         // Single-frame PNG has no animation delay → Imagick returns 0
@@ -829,21 +817,320 @@ final class ImagickDriverTest extends TestCase
         $this->loaded()->getFrameDelay(2);
     }
 
-    public function testSetFrameDelayThrowsUnsupportedOperationException(): void
-    {
-        $this->expectException(UnsupportedOperationException::class);
-        $this->loaded()->setFrameDelay(0, 100);
-    }
-
-    public function testGetLoopCountAlwaysReturns0(): void
+    public function testGetLoopCountReturns0ForAStillImage(): void
     {
         self::assertSame(0, $this->loaded()->getLoopCount());
     }
 
-    public function testSetLoopCountThrowsUnsupportedOperationException(): void
+    // ─── Animation ────────────────────────────────────────────────────────────
+
+    /**
+     * Encoded animated GIF: one plain-colored frame per color, delays of 100 ms, 200 ms...
+     *
+     * @param list<string> $colors
+     */
+    private function makeAnimatedGif(array $colors = ['red', 'lime', 'blue'], int $width = 20, int $height = 10): string
     {
-        $this->expectException(UnsupportedOperationException::class);
-        $this->loaded()->setLoopCount(3);
+        $sequence = new Imagick();
+        foreach ($colors as $i => $color) {
+            $frame = new Imagick();
+            $frame->newImage($width, $height, new \ImagickPixel($color), 'gif');
+            $frame->setImageTicksPerSecond(100);
+            $frame->setImageDelay(10 * ($i + 1));
+            $sequence->addImage($frame);
+        }
+
+        $sequence->setIteratorIndex(0);
+        $sequence->setImageIterations(2);
+        $sequence->setFormat('gif');
+
+        return $sequence->getImagesBlob();
+    }
+
+    private function animated(): ImagickDriver
+    {
+        return (new ImagickDriver())->fromString($this->makeAnimatedGif());
+    }
+
+    private function reread(string $data): Imagick
+    {
+        $imagick = new Imagick();
+        $imagick->readImageBlob($data);
+
+        return $imagick;
+    }
+
+    /**
+     * Color of the center pixel of a frame, as "r,g,b".
+     */
+    private function centerColor(ImagickDriver $driver, int $index): string
+    {
+        /** @var Imagick $frame */
+        $frame = $driver->getFrame($index);
+        $rgb = $frame->getImagePixelColor(
+            intdiv($frame->getImageWidth(), 2),
+            intdiv($frame->getImageHeight(), 2),
+        )->getColor();
+
+        return $rgb['r'] . ',' . $rgb['g'] . ',' . $rgb['b'];
+    }
+
+    public function testAnimatedGifIsLoadedWithAllFramesAndTimings(): void
+    {
+        $driver = $this->animated();
+
+        self::assertSame(Format::GIF, $driver->getFormat());
+        self::assertSame(3, $driver->getFrameCount());
+        self::assertCount(3, $driver->getFrames());
+        self::assertSame(100, $driver->getFrameDelay(0));
+        self::assertSame(300, $driver->getFrameDelay(2));
+        self::assertSame(2, $driver->getLoopCount());
+        self::assertSame('0,0,255', $this->centerColor($driver, 2));
+    }
+
+    public function testOperationsApplyToEveryFrame(): void
+    {
+        $driver = $this->animated()->resize(10, 4, Fit::FILL)->flip(Flip::HORIZONTAL)->negate();
+
+        self::assertSame(3, $driver->getFrameCount());
+        foreach ($driver->getFrames() as $frame) {
+            self::assertSame(10, $frame->getImageWidth());
+            self::assertSame(4, $frame->getImageHeight());
+        }
+
+        // Negated: red → cyan, lime → magenta, blue → yellow
+        self::assertSame('0,255,255', $this->centerColor($driver, 0));
+        self::assertSame('255,0,255', $this->centerColor($driver, 1));
+        self::assertSame('255,255,0', $this->centerColor($driver, 2));
+    }
+
+    public function testReplacingCanvasKeepsTheFrameTimings(): void
+    {
+        $driver = $this->animated()->resize(30, 30, Fit::CONTAIN, background: Color::fromHex('#ffffff'));
+
+        self::assertSame(3, $driver->getFrameCount());
+        self::assertSame(30, $driver->getWidth());
+        self::assertSame(200, $driver->getFrameDelay(1));
+        self::assertSame(2, $driver->getLoopCount());
+        self::assertSame('0,255,0', $this->centerColor($driver, 1));
+    }
+
+    public function testCropAppliesToEveryFrame(): void
+    {
+        $driver = $this->animated()->crop(5, 5, 2, 2);
+
+        foreach ($driver->getFrames() as $frame) {
+            self::assertSame([5, 5], [$frame->getImageWidth(), $frame->getImageHeight()]);
+        }
+    }
+
+    public function testTrimKeepsTheBoxOfTheWidestFrame(): void
+    {
+        // White 40×40 frames: a black square at (5,5)-(14,14), then one at (20,25)-(29,34)
+        $sequence = new Imagick();
+        foreach ([[5, 5], [20, 25]] as [$x, $y]) {
+            $frame = new Imagick();
+            $frame->newImage(40, 40, new \ImagickPixel('white'), 'gif');
+            $draw = new \ImagickDraw();
+            $draw->setFillColor(new \ImagickPixel('black'));
+            $draw->rectangle($x, $y, $x + 9, $y + 9);
+            $frame->drawImage($draw);
+            $sequence->addImage($frame);
+        }
+        $sequence->setFormat('gif');
+
+        $driver = (new ImagickDriver())->fromString($sequence->getImagesBlob())->trim();
+
+        self::assertSame(2, $driver->getFrameCount());
+        foreach ($driver->getFrames() as $frame) {
+            self::assertSame([25, 30], [$frame->getImageWidth(), $frame->getImageHeight()]);
+        }
+    }
+
+    public function testWebpOutputKeepsTheAnimation(): void
+    {
+        if (Imagick::queryFormats('WEBP') === []) {
+            self::markTestSkipped('No WebP support in this ImageMagick build.');
+        }
+
+        $output = $this->reread($this->animated()->toWebp()->toString());
+
+        self::assertSame(3, $output->getNumberImages());
+    }
+
+    public function testGifOutputKeepsTheAnimation(): void
+    {
+        $output = $this->reread($this->animated()->resize(10, 5, Fit::FILL)->toGif()->toString());
+
+        self::assertSame(3, $output->getNumberImages());
+        $output->setIteratorIndex(1);
+        self::assertSame(20, $output->getImageDelay());
+        self::assertSame(10, $output->getImageWidth());
+    }
+
+    public function testStillFormatOutputKeepsTheFirstFrame(): void
+    {
+        $output = $this->reread($this->animated()->toPng()->toString());
+
+        self::assertSame(1, $output->getNumberImages());
+        $rgb = $output->getImagePixelColor(5, 5)->getColor();
+        self::assertSame([255, 0, 0], [$rgb['r'], $rgb['g'], $rgb['b']]);
+    }
+
+    public function testCopyKeepsAllFrames(): void
+    {
+        $copy = $this->animated()->copy();
+
+        self::assertSame(3, $copy->getFrameCount());
+    }
+
+    public function testAddFrameAppendsByDefault(): void
+    {
+        $frame = new Imagick();
+        $frame->newImage(20, 10, new \ImagickPixel('white'), 'png');
+
+        $driver = $this->animated()->addFrame($frame, 250);
+
+        self::assertSame(4, $driver->getFrameCount());
+        self::assertSame(250, $driver->getFrameDelay(3));
+        self::assertSame('255,255,255', $this->centerColor($driver, 3));
+        self::assertSame(2, $driver->getLoopCount());
+    }
+
+    public function testAddFrameInsertsAtIndex(): void
+    {
+        $frame = new Imagick();
+        $frame->newImage(20, 10, new \ImagickPixel('white'), 'png');
+
+        $driver = $this->animated()->addFrame($frame, 50, 0);
+
+        self::assertSame(4, $driver->getFrameCount());
+        self::assertSame('255,255,255', $this->centerColor($driver, 0));
+        self::assertSame(50, $driver->getFrameDelay(0));
+        self::assertSame('255,0,0', $this->centerColor($driver, 1));
+    }
+
+    public function testAddFrameTurnsAStillImageIntoAnAnimation(): void
+    {
+        $frame = new Imagick();
+        $frame->newImage(20, 20, new \ImagickPixel('white'), 'png');
+
+        $output = $this->reread($this->loaded()->addFrame($frame, 100)->toGif()->toString());
+
+        self::assertSame(2, $output->getNumberImages());
+    }
+
+    public function testAddFrameRejectsADifferentSize(): void
+    {
+        $frame = new Imagick();
+        $frame->newImage(5, 5, new \ImagickPixel('white'), 'png');
+
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->animated()->addFrame($frame, 100);
+    }
+
+    public function testAddFrameRejectsANonImagickFrame(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->animated()->addFrame('not a frame', 100);
+    }
+
+    public function testAddFrameRejectsANegativeDelay(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->animated()->addFrame(new Imagick(), -1);
+    }
+
+    public function testAddFrameRejectsAnOutOfBoundsIndex(): void
+    {
+        $frame = new Imagick();
+        $frame->newImage(20, 10, new \ImagickPixel('white'), 'png');
+
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->animated()->addFrame($frame, 100, 4);
+    }
+
+    public function testAddFrameCountsTheNewFrameInThePixelLimit(): void
+    {
+        $frame = new Imagick();
+        $frame->newImage(20, 10, new \ImagickPixel('white'), 'png');
+
+        $driver = (new ImagickDriver())->limitPixels(20 * 10 * 3)->fromString($this->makeAnimatedGif());
+
+        $this->expectException(ImageLimitExceededException::class);
+        $driver->addFrame($frame, 100);
+    }
+
+    public function testRemoveFrame(): void
+    {
+        $driver = $this->animated()->removeFrame(0);
+
+        self::assertSame(2, $driver->getFrameCount());
+        self::assertSame('0,255,0', $this->centerColor($driver, 0));
+        self::assertSame(2, $driver->getLoopCount());
+    }
+
+    public function testRemoveFrameRefusesTheOnlyFrame(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->loaded()->removeFrame(0);
+    }
+
+    public function testRemoveFrameThrowsForOutOfBoundsIndex(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->animated()->removeFrame(3);
+    }
+
+    public function testSetFrameDelayRoundsToHundredthsOfASecond(): void
+    {
+        $driver = $this->animated()->setFrameDelay(1, 500)->setFrameDelay(2, 25);
+
+        self::assertSame(500, $driver->getFrameDelay(1));
+        self::assertSame(30, $driver->getFrameDelay(2));
+        self::assertSame(100, $driver->getFrameDelay(0));
+    }
+
+    public function testSetFrameDelayRejectsANegativeDelay(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->animated()->setFrameDelay(0, -10);
+    }
+
+    public function testSetFrameDelayThrowsForOutOfBoundsIndex(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->animated()->setFrameDelay(5, 100);
+    }
+
+    public function testSetLoopCountIsWrittenToTheOutput(): void
+    {
+        $driver = $this->animated()->setLoopCount(5);
+        self::assertSame(5, $driver->getLoopCount());
+
+        $output = $this->reread($driver->toString());
+        self::assertSame(5, $output->getImageIterations());
+    }
+
+    public function testSetLoopCountRejectsANegativeCount(): void
+    {
+        $this->expectException(InvalidImageArgumentException::class);
+        $this->animated()->setLoopCount(-1);
+    }
+
+    public function testPixelLimitCountsAllFrames(): void
+    {
+        $this->expectException(ImageLimitExceededException::class);
+        (new ImagickDriver())->limitPixels(20 * 10 * 2)->fromString($this->makeAnimatedGif());
+    }
+
+    public function testAnimationOperationsAreSupported(): void
+    {
+        $driver = new ImagickDriver();
+
+        foreach (['addFrame', 'removeFrame', 'setFrameDelay', 'setLoopCount'] as $operation) {
+            self::assertTrue($driver->supportsOperation($operation), $operation);
+        }
     }
 
     // =========================================================================
